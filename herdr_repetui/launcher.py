@@ -77,10 +77,17 @@ def ensure_owner(
         if state == "stale":
             config.socket.unlink(missing_ok=True)  # only here, only under the lock
         private_dir(config.socket.parent)
-        result = spawn(owner_argv(config), env=owner_env(config, env, herdr_config), check=False)
+        argv, owner = owner_argv(config), owner_env(config, env, herdr_config)
+        deadline = clock() + timeout               # covers the spawn too: the lock is held throughout
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise LaunchError("repetui did not start in time")
+        try:
+            result = spawn(argv, env=owner, check=False, timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise LaunchError("dtach did not return in time") from None
         if getattr(result, "returncode", 0) != 0:
             raise LaunchError(f"dtach failed to start repetui (exit {result.returncode})")
-        deadline = clock() + timeout
         while probe(config.socket) != "live":
             if clock() > deadline:
                 raise LaunchError("repetui did not start in time")

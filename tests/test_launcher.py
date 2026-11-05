@@ -1,3 +1,6 @@
+import fcntl
+import os
+import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +11,7 @@ from herdr_repetui.config import load_config
 from herdr_repetui.launcher import (
     LaunchError, ensure_owner, herdr_keys_value, owner_argv, owner_env, viewer_argv,
 )
+from herdr_repetui.dtach import SocketProbeError
 from herdr_repetui.locking import global_lock
 
 
@@ -32,14 +36,92 @@ def test_live_socket_takes_no_lock_and_spawns_nothing(cfg, monkeypatch) -> None:
     assert spawned == []
 
 
-def test_stale_socket_is_unlinked_under_lock_then_owner_started(cfg) -> None:
+def lock_is_held(path: Path) -> bool:
+    """True if some other open file description holds the flock (flock conflicts per description)."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)               # closing also drops a lock we just took
+    return False
+
+
+def test_stale_socket_is_unlinked_under_lock_then_owner_started(cfg, monkeypatch) -> None:
     c = cfg
     c.socket.write_text("")
+    held = []                                      # lock state observed at each step, in order
+    real_unlink = Path.unlink
+
+    def unlink(self, *a, **k):
+        if self == c.socket:
+            held.append(("unlink", lock_is_held(c.lock_path)))
+        return real_unlink(self, *a, **k)
+    monkeypatch.setattr(Path, "unlink", unlink)
+
     states = iter(["stale", "stale", "absent", "live"])
+
+    def probe(path):
+        state = next(states)
+        held.append((f"probe-{state}", lock_is_held(c.lock_path)))
+        return state
+
     spawned = []
-    ensure_owner(c, {}, spawn=lambda argv, **k: (spawned.append(argv), SimpleNamespace(returncode=0))[1],
-                 probe=lambda p: next(states), sleep=lambda s: None)
+
+    def spawn(argv, **k):
+        held.append(("spawn", lock_is_held(c.lock_path)))
+        spawned.append(argv)
+        return SimpleNamespace(returncode=0)
+
+    ensure_owner(c, {}, spawn=spawn, probe=probe, sleep=lambda s: None)
     assert not c.socket.exists() and spawned == [owner_argv(c)]
+    assert held == [("probe-stale", False),        # fast-path probe: no lock yet
+                    ("probe-stale", True),         # re-probe under the lock
+                    ("unlink", True),              # cleanup only under the lock
+                    ("spawn", True),
+                    ("probe-absent", True),
+                    ("probe-live", True)]
+    assert not lock_is_held(c.lock_path)           # released afterwards
+
+
+def test_probe_error_never_unlinks(cfg) -> None:
+    c = cfg
+    c.socket.write_text("")
+
+    def probe(path):
+        raise SocketProbeError("EACCES")
+    with pytest.raises(SocketProbeError):
+        ensure_owner(c, {}, spawn=lambda *a, **k: pytest.fail("must not spawn"), probe=probe)
+    assert c.socket.exists()
+
+
+def test_spawn_gets_the_remaining_startup_budget(cfg) -> None:
+    ticks = iter([0, 4, 4, 4])                     # deadline = 0 + 10, 4 s already used at spawn time
+    kwargs = {}
+    states = iter(["absent", "absent", "live"])
+
+    def spawn(argv, **k):
+        kwargs.update(k)
+        return SimpleNamespace(returncode=0)
+    ensure_owner(cfg, {}, spawn=spawn, probe=lambda p: next(states), sleep=lambda s: None,
+                 clock=lambda: next(ticks), timeout=10)
+    assert kwargs["timeout"] == 6 and kwargs["check"] is False
+
+
+def test_hung_spawn_becomes_launch_error_and_releases_lock(cfg) -> None:
+    def spawn(argv, **k):
+        raise subprocess.TimeoutExpired(argv, k["timeout"])
+    with pytest.raises(LaunchError, match="did not return in time"):
+        ensure_owner(cfg, {}, spawn=spawn, probe=lambda p: "absent", sleep=lambda s: None)
+    assert not lock_is_held(cfg.lock_path)
+
+
+def test_no_spawn_when_budget_already_spent(cfg) -> None:
+    ticks = iter([0, 11])
+    with pytest.raises(LaunchError):
+        ensure_owner(cfg, {}, spawn=lambda *a, **k: pytest.fail("must not spawn"),
+                     probe=lambda p: "absent", sleep=lambda s: None, clock=lambda: next(ticks), timeout=10)
 
 
 def test_timeout_raises(cfg) -> None:

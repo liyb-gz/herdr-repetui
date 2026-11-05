@@ -16,10 +16,18 @@ class LockTimeout(RuntimeError):
 
 
 def private_dir(path: Path) -> None:
+    """Create `path` (0700) or accept an existing real directory that only we can modify.
+
+    mkdir's mode never tightens an existing directory, so check it: if another user could write
+    here they could replace the lock (or socket) pathname while we keep flocking the old inode.
+    Never chmod silently; refuse instead. lstat, so a symlink is rejected, not followed."""
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         raise PermissionError(f"refusing to use {path}: not a directory owned by this user")
+    if info.st_mode & 0o022:
+        raise PermissionError(f"refusing to use {path}: writable by group or others "
+                              f"(mode {stat.S_IMODE(info.st_mode):04o}); run chmod go-w on it")
 
 
 @contextmanager
