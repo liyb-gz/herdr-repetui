@@ -235,13 +235,16 @@ def _show(placement: str, target: str, ctx: Context, herdr: Herdr, config: Confi
     try:
         moved = herdr.move_beside(pane, ctx.tab_id, target, _DIRECTION[placement], ratio)
     except HerdrError:
+        # Clear the marker only if herdr confirms closing the pane we opened. A "gone" reply is
+        # ambiguous: the move may have happened (new id) with only its reply lost. Any other
+        # error is unknown too. Either way the kept marker makes the next action scan this server.
+        # The move error is what the user needs to see, so a cleanup error never replaces it.
         try:
-            _close(herdr, pane, herdr.socket_path)
-            save_state(config.state_path, None, placement)
+            herdr.close_viewer(pane, herdr.socket_path)
         except HerdrError:
-            # not confirmed closed: keep it recorded (tab unknown) so the next action closes it;
-            # the move error is what the user needs to see
-            save_state(config.state_path, Viewer(herdr.socket_path, pane, "", "", placement), placement)
+            pass
+        else:
+            save_state(config.state_path, None, placement)
         raise
     save_state(config.state_path, Viewer(herdr.socket_path, moved, ctx.tab_id, target, placement), placement)
     return moved
@@ -285,6 +288,9 @@ def quit_repetui(ctx: Context, herdr: Herdr, config: Config, *, plugin_id: str =
                  wait: float = 5.0, sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic) -> str:
     if socket_state(config.socket) != "live":
+        if load_pending(config.state_path) is not None:  # an interrupted show left an orphan pane
+            with global_lock(config.lock_path):
+                _settle_pending(herdr, config, ctx)
         _notice(herdr, "Nothing to quit.", title="repetui is not running")
         return "not_running"
     with global_lock(config.lock_path):

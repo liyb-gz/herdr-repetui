@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 PLACEMENTS = frozenset({"bottom", "side"})
+STARTED_AT_MAX = 1e11  # epoch seconds; anything at or beyond this (year ~5138) is corrupt
 
 
 @dataclass
@@ -53,15 +54,21 @@ def _pending(raw: object) -> Pending | None:
     socket, started = raw["server_socket"], raw["started_at"]
     if not isinstance(socket, str) or not socket:
         return None
-    if isinstance(started, bool) or not isinstance(started, (int, float)) or not math.isfinite(started):
+    if isinstance(started, bool) or not isinstance(started, (int, float)):
         return None
-    return Pending(socket, float(started))
+    try:
+        started = float(started)
+    except (ValueError, OverflowError, TypeError):   # e.g. a 400-digit integer
+        return None
+    if not math.isfinite(started) or not 0 < started < STARTED_AT_MAX:
+        return None
+    return Pending(socket, started)
 
 
 def _read(path: Path) -> dict:
     try:
         data = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):  # RecursionError: absurdly nested JSON
         return {}
     return data if isinstance(data, dict) else {}
 

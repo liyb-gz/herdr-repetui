@@ -418,8 +418,9 @@ def test_failed_cleanup_close_keeps_the_move_error(env, monkeypatch) -> None:
     with pytest.raises(HerdrError) as info:
         toggle("bottom", ctx, herdr, config)
     assert info.value.code == "not_moved"
-    viewer, _ = load_state(config.state_path)      # not confirmed closed, so it stays recorded
-    assert viewer is not None and viewer.pane_id in {p for _, p in herdr.viewers} and viewer.tab_id == ""
+    # fix round 2: not confirmed closed, so the pending marker stays for the next action's scan
+    assert load_pending(config.state_path) is not None and load_state(config.state_path)[0] is None
+    assert len(herdr.viewers) == 1
 
 
 @pytest.mark.parametrize("layout", [
@@ -698,6 +699,12 @@ def test_adopted_viewer_close_timeout_keeps_it_recorded(env, monkeypatch) -> Non
     "[]", '"x"', "5", '{"server_socket": "/s"}', '{"server_socket": 3, "started_at": 1}',
     '{"server_socket": "", "started_at": 1}', '{"server_socket": "/s", "started_at": "1"}',
     '{"server_socket": "/s", "started_at": true}', '{"server_socket": "/s", "started_at": 1, "x": 1}',
+    # fix round 2: never crash, reject non-finite and out-of-range timestamps
+    '{"server_socket": "/s", "started_at": %s}' % ("1" + "0" * 400),
+    '{"server_socket": "/s", "started_at": NaN}', '{"server_socket": "/s", "started_at": "nan"}',
+    '{"server_socket": "/s", "started_at": Infinity}', '{"server_socket": "/s", "started_at": 1e400}',
+    '{"server_socket": "/s", "started_at": -5}', '{"server_socket": "/s", "started_at": 0}',
+    '{"server_socket": "/s", "started_at": 1e11}', '{"server_socket": "/s", "started_at": "1700000000"}',
 ])
 def test_malformed_pending_marker_counts_as_none(short_dir, pending) -> None:
     path = short_dir / "s.json"
@@ -711,3 +718,62 @@ def test_pending_marker_round_trip(short_dir) -> None:
     assert load_pending(path) == Pending("/s.sock", 12.5)
     save_state(path, None, "bottom")
     assert load_pending(path) is None
+
+
+# --- fix round 2 ---
+
+
+def test_deeply_nested_state_file_reads_as_empty(short_dir) -> None:
+    path = short_dir / "s.json"
+    path.write_text("[" * 100000 + "]" * 100000)
+    assert load_state(path) == (None, "bottom") and load_pending(path) is None
+
+
+def test_move_timeout_after_id_change_then_toggle_on_server_b_leaves_one_viewer(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    real_move = herdr.move_beside
+
+    def move_then_time_out(*args):
+        real_move(*args)                               # herdr moved it (new id) but the reply was lost
+        raise HerdrError("timeout", "pane move")
+
+    monkeypatch.setattr(herdr, "move_beside", move_then_time_out)
+    with pytest.raises(HerdrError) as info:
+        toggle("bottom", ctx, herdr, config)
+    assert info.value.code == "timeout"
+    closes = [c for c in herdr.calls if c[0] == "close"]
+    assert closes and not closes[0][1].endswith("m")   # cleanup tried the OLD id: herdr says gone
+    assert len(herdr.viewers) == 1                     # the moved viewer survives ...
+    assert load_pending(config.state_path) is not None  # ... so the marker must too
+    b = _server_b(herdr)
+    assert toggle("bottom", Context("w1", "w1:t1", "w1:p1", SRV_B, ROOT), b, config) == "shown"
+    assert len(herdr.viewers) == 1 and next(iter(herdr.viewers))[0] == SRV_B
+    assert load_pending(config.state_path) is None
+
+
+def test_confirmed_cleanup_close_clears_the_marker(env) -> None:
+    config, herdr, ctx = env
+    herdr.fail_move = True
+    with pytest.raises(HerdrError):
+        toggle("bottom", ctx, herdr, config)
+    assert load_pending(config.state_path) is None and not herdr.viewers
+
+
+def test_quit_while_not_running_settles_a_leftover_marker(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    monkeypatch.setattr(herdr, "move_beside", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        toggle("bottom", ctx, herdr, config)
+    orphan = next(iter(herdr.viewers))
+    monkeypatch.setattr(actions, "socket_state", lambda p: "absent")
+    herdr.calls.clear()
+    assert quit_repetui(ctx, herdr, config) == "not_running"
+    assert ("close", orphan[1], orphan[0]) in herdr.calls and not herdr.viewers
+    assert load_pending(config.state_path) is None and "open" not in kinds(herdr)
+
+
+def test_quit_while_not_running_without_marker_takes_no_lock(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    monkeypatch.setattr(actions, "socket_state", lambda p: "absent")
+    monkeypatch.setattr(actions, "global_lock", lambda *a, **k: pytest.fail("lock taken"))
+    assert quit_repetui(ctx, herdr, config) == "not_running"
