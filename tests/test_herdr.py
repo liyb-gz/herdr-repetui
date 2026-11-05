@@ -630,3 +630,58 @@ def test_focus_requires_the_pane_info_of_the_focused_pane(short_dir, reply, ok) 
     finally:
         t.join()
         Path(path).unlink(missing_ok=True)
+
+
+def test_panes_on_lists_another_server_over_its_socket(short_dir) -> None:
+    path = str(short_dir / "pl.sock")
+    seen = {}
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(path)
+    server.listen(1)
+
+    def loop():
+        conn, _ = server.accept()
+        data = b""
+        while not data.endswith(b"\n"):
+            data += conn.recv(4096)
+        seen.update(json.loads(data))
+        reply = {"id": seen["id"], "result": {"type": "pane_list", "panes": [
+            {"pane_id": "w5:p1", "tab_id": "w5:t1", "workspace_id": "w5", "focused": True}]}}
+        conn.sendall(json.dumps(reply).encode() + b"\n")
+        conn.close()
+        server.close()
+
+    t = threading.Thread(target=loop)
+    t.start()
+    try:
+        panes = Herdr("herdr", "/tmp/none.sock").panes_on(path)
+    finally:
+        t.join()
+        Path(path).unlink(missing_ok=True)
+    assert seen["method"] == "pane.list" and seen["params"] == {}
+    assert panes == [{"pane_id": "w5:p1", "tab_id": "w5:t1", "workspace_id": "w5"}]
+
+
+@pytest.mark.parametrize("reply", [
+    b'{"id":"$ID","result":{"type":"pane_list"}}\n',
+    b'{"id":"$ID","result":{"type":"pane_info","panes":[]}}\n',
+    b'{"id":"$ID","result":{"type":"pane_list","panes":[{"pane_id":""}]}}\n',
+    b'{"id":"$ID","result":{"type":"pane_list","panes":[{"pane_id":"w1:p1","tab_id":4}]}}\n',
+    b'{"id":"$ID","result":{"type":"pane_list","panes":"w1:p1"}}\n',
+])
+def test_panes_on_rejects_a_malformed_listing(short_dir, reply) -> None:
+    path = str(short_dir / "pm.sock")
+    t = serve_once(path, reply)
+    try:
+        with pytest.raises(HerdrError) as info:
+            Herdr("herdr", "/tmp/none.sock").panes_on(path)
+        assert info.value.code == "bad_response"
+    finally:
+        t.join()
+        Path(path).unlink(missing_ok=True)
+
+
+def test_panes_on_unreachable_server(short_dir) -> None:
+    with pytest.raises(HerdrError) as info:
+        Herdr("herdr", "/tmp/none.sock").panes_on(str(short_dir / "gone.sock"))
+    assert info.value.code == "server_unreachable"

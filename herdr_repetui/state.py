@@ -1,8 +1,17 @@
-"""User-wide viewer record (guarded by the global lock)."""
+"""User-wide viewer record (guarded by the global lock).
+
+state.json: {"viewer": {...} | null, "last_placement": "bottom" | "side",
+             "pending": {"server_socket": str, "started_at": float} | null}
+
+`pending` is written just before a viewer pane is opened and replaced by the full viewer record
+once the move succeeded (or cleared once the new pane was closed again). If the action dies in
+between, the marker names the server whose panes must be scanned for the orphan.
+"""
 
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -19,6 +28,12 @@ class Viewer:
     placement: str
 
 
+@dataclass(frozen=True)
+class Pending:
+    server_socket: str
+    started_at: float
+
+
 def _viewer(raw: object) -> Viewer | None:
     """A well-formed record, or None: a corrupt record is treated as no record (the adoption scan,
     which needs the ownership token, then finds a live viewer if there is one)."""
@@ -31,19 +46,42 @@ def _viewer(raw: object) -> Viewer | None:
     return Viewer(**raw)
 
 
-def load_state(path: Path) -> tuple[Viewer | None, str]:
+def _pending(raw: object) -> Pending | None:
+    """A well-formed marker, or None (a malformed marker counts as no marker)."""
+    if not isinstance(raw, dict) or set(raw) != {"server_socket", "started_at"}:
+        return None
+    socket, started = raw["server_socket"], raw["started_at"]
+    if not isinstance(socket, str) or not socket:
+        return None
+    if isinstance(started, bool) or not isinstance(started, (int, float)) or not math.isfinite(started):
+        return None
+    return Pending(socket, float(started))
+
+
+def _read(path: Path) -> dict:
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
-        return None, "bottom"
-    if not isinstance(data, dict):
-        return None, "bottom"
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_state(path: Path) -> tuple[Viewer | None, str]:
+    data = _read(path)
     last = data.get("last_placement")
-    return _viewer(data.get("viewer")), last if last in PLACEMENTS else "bottom"
+    return _viewer(data.get("viewer")), last if isinstance(last, str) and last in PLACEMENTS else "bottom"
 
 
-def save_state(path: Path, viewer: Viewer | None, last_placement: str) -> None:
+def load_pending(path: Path) -> Pending | None:
+    return _pending(_read(path).get("pending"))
+
+
+def save_state(path: Path, viewer: Viewer | None, last_placement: str, *,
+               pending: Pending | None = None) -> None:
+    """Write the whole state. The marker is dropped unless passed: every action settles a marker
+    first, so later writes in the same action must not resurrect it."""
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps({"viewer": asdict(viewer) if viewer else None,
-                               "last_placement": last_placement}))
+                               "last_placement": last_placement,
+                               "pending": asdict(pending) if pending else None}))
     os.replace(tmp, path)

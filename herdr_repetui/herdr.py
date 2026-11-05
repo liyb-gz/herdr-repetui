@@ -76,6 +76,23 @@ def _check_processes(processes: object, pane_id: str) -> list[dict]:
     return processes
 
 
+def _pane_entries(envelope: object, what: str) -> list[dict]:
+    """Strictly validated `pane_list` result, normalised to {pane_id, tab_id, workspace_id}."""
+    listed = _result_of(envelope, "pane_list", what).get("panes")
+    if not isinstance(listed, list):
+        raise _bad(f"{what}: panes is not a list")
+    panes = []
+    for pane in listed:
+        if not isinstance(pane, dict) or not isinstance(pane.get("pane_id"), str) or not pane["pane_id"]:
+            raise _bad(f"{what}: entry without a string pane_id")
+        for key in ("tab_id", "workspace_id"):
+            if pane.get(key) is not None and not isinstance(pane[key], str):
+                raise _bad(f"{what}: {key} is not a string")
+        panes.append({"pane_id": pane["pane_id"], "tab_id": pane.get("tab_id"),
+                      "workspace_id": pane.get("workspace_id")})
+    return panes
+
+
 class Herdr:
     def __init__(self, bin_path: str, socket_path: str, *,
                  run: Callable[..., object] = subprocess.run, timeout: float = 5.0) -> None:
@@ -226,20 +243,12 @@ class Herdr:
     def panes(self) -> list[dict]:
         # `pane list` without --workspace covers all workspaces (verified on herdr 0.9.5)
         # {"id", "result": {"type": "pane_list", "panes": [{"pane_id", "tab_id", "workspace_id", ...}]}}
-        result = _result_of(self.cli("pane", "list"), "pane_list", "pane list")
-        listed = result.get("panes")
-        if not isinstance(listed, list):
-            raise _bad("pane list: panes is not a list")
-        panes = []
-        for pane in listed:
-            if not isinstance(pane, dict) or not isinstance(pane.get("pane_id"), str):
-                raise _bad("pane list: entry without a string pane_id")
-            for key in ("tab_id", "workspace_id"):
-                if pane.get(key) is not None and not isinstance(pane[key], str):
-                    raise _bad(f"pane list: {key} is not a string")
-            panes.append({"pane_id": pane["pane_id"], "tab_id": pane.get("tab_id"),
-                          "workspace_id": pane.get("workspace_id")})
-        return panes
+        return _pane_entries(self.cli("pane", "list"), "pane list")
+
+    def panes_on(self, socket_path: str) -> list[dict]:
+        """All panes of the herdr server at `socket_path` (raw `pane.list`, no workspace filter):
+        the only way to list another server's panes. Same result shape as `pane list`."""
+        return _pane_entries(self.request("pane.list", {}, socket_path=socket_path), "pane.list")
 
     def layout(self, pane_id: str) -> dict:
         # {"id", "result": {"type": "pane_layout", "layout": {"area": {...}, "panes": [...], "splits": [...]}}}

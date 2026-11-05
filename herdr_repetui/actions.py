@@ -16,7 +16,7 @@ from .dtach import socket_state
 from .herdr import GONE_CODES, Herdr, HerdrError
 from .locking import global_lock
 from .sizing import MIN_COLS, MIN_ROWS, split_ratio
-from .state import Viewer, load_state, save_state
+from .state import Pending, Viewer, load_pending, load_state, save_state
 
 _DIRECTION = {"bottom": "down", "side": "right"}
 
@@ -87,7 +87,7 @@ def is_viewer(processes: list[dict] | None, socket: Path, plugin_root: str, *,
     return False
 
 
-ADOPT_WAIT = 2.0  # seconds to wait for a tokenless launcher to re-exec with --owner
+ADOPT_WAIT = 2.0  # seconds to wait for process info to resolve (launcher re-exec, missing argv)
 _sleep = time.sleep
 _clock = time.monotonic
 
@@ -102,32 +102,37 @@ def _tokenless_launcher(processes: list[dict] | None, plugin_root: str) -> bool:
 
 
 def _unknown(processes: list[dict] | None) -> bool:
-    """herdr returned processes but without argv: we cannot tell, so never discard on this."""
+    """herdr returned processes but some lack argv: we cannot tell whose pane this is."""
     return bool(processes) and any(not p.get("argv") for p in processes)
 
 
-def _resolved_processes(herdr: Herdr, pane_id: str, plugin_root: str) -> list[dict] | None:
-    """Re-read a pane until any launcher of ours has re-exec'd with its ownership token.
+def _poll(herdr: Herdr, pane_id: str, socket_path: str | None,
+          unresolved: Callable[[list[dict]], bool]) -> list[dict] | None:
+    """Read a pane's processes until they are resolved or the pane is confirmed gone (None).
 
-    An action that died between `plugin pane open` and saving the record can leave a launcher
-    that is still tokenless; adopting nothing would open a second viewer, adopting blindly could
-    close someone else's. So wait briefly, and abort the action if ownership stays unknown.
+    Unresolved for longer than ADOPT_WAIT aborts the action with `ownership_unresolved`: neither
+    keeping a stale owner nor discarding a live one is safe, so nothing is changed.
     """
-    processes = herdr.foreground_processes(pane_id)
-    if not _tokenless_launcher(processes, plugin_root):
-        return processes
-    # A candidate was seen: it is resolved only when the pane is gone, or every process has argv
-    # and none is a tokenless launcher. Missing/null argv (allowed by herdr's schema) is NOT proof.
-    deadline = _clock() + ADOPT_WAIT
-    while True:
-        if processes is None:
-            return None
-        if not _tokenless_launcher(processes, plugin_root) and not _unknown(processes):
-            return processes
-        if _clock() > deadline:
-            raise HerdrError("ownership_unresolved", f"launcher in {pane_id} never identified itself")
+    processes = herdr.foreground_processes(pane_id, socket_path)
+    deadline = None
+    while processes is not None and unresolved(processes):
+        if deadline is None:
+            deadline = _clock() + ADOPT_WAIT
+        elif _clock() > deadline:
+            raise HerdrError("ownership_unresolved", f"cannot tell whether {pane_id} is our viewer")
         _sleep(0.05)
-        processes = herdr.foreground_processes(pane_id)
+        processes = herdr.foreground_processes(pane_id, socket_path)
+    return processes
+
+
+def _scan_processes(herdr: Herdr, pane_id: str, socket_path: str | None, config: Config,
+                    ctx: Context) -> list[dict] | None:
+    """Processes of a pane met in an adoption scan. A tokenless launcher of ours (an action died
+    between `plugin pane open` and its re-exec) or an argv-less entry is unresolved: adopting
+    nothing could leave a second viewer, adopting blindly could close someone else's. An empty
+    list is resolved: no foreground process, so not a viewer."""
+    return _poll(herdr, pane_id, socket_path, lambda ps: not is_viewer(ps, config.socket, ctx.plugin_root)
+                 and (_tokenless_launcher(ps, ctx.plugin_root) or _unknown(ps)))
 
 
 def _close(herdr: Herdr, pane_id: str, server_socket: str) -> None:
@@ -139,17 +144,52 @@ def _close(herdr: Herdr, pane_id: str, server_socket: str) -> None:
             raise
 
 
+def _settle_pending(herdr: Herdr, config: Config, ctx: Context) -> None:
+    """An earlier action wrote a pending marker and died before recording its pane. Scan the
+    marker's server (raw socket: it may be another herdr server) for a pane of ours and close it,
+    recording it first so a failed close is retried. The marker is cleared only once the scan
+    found nothing left, or the server is unreachable (its panes are gone with it)."""
+    pending = load_pending(config.state_path)
+    if pending is None:
+        return
+    viewer, last = load_state(config.state_path)
+    try:
+        panes = herdr.panes_on(pending.server_socket)
+    except HerdrError as exc:
+        if exc.code != "server_unreachable":
+            raise                                    # unknown: keep the marker, abort the action
+        panes = []
+    for pane in panes:
+        if viewer is not None and (viewer.server_socket, viewer.pane_id) == (pending.server_socket,
+                                                                             pane["pane_id"]):
+            continue                                 # already recorded: handled as the viewer
+        processes = _scan_processes(herdr, pane["pane_id"], pending.server_socket, config, ctx)
+        if not is_viewer(processes, config.socket, ctx.plugin_root):
+            continue
+        orphan = Viewer(pending.server_socket, pane["pane_id"], pane.get("tab_id") or "", "", last)
+        save_state(config.state_path, viewer or orphan, last, pending=pending)
+        _close(herdr, orphan.pane_id, orphan.server_socket)
+        save_state(config.state_path, viewer, last, pending=pending)
+    save_state(config.state_path, viewer, last)
+
+
 def _current_viewer(herdr: Herdr, config: Config, ctx: Context) -> Viewer | None:
     viewer, last = load_state(config.state_path)
     if viewer is not None:
-        processes = herdr.foreground_processes(viewer.pane_id, viewer.server_socket)
-        if is_viewer(processes, config.socket, ctx.plugin_root, recorded=True) or _unknown(processes):
+        # The record proves ownership, so a tokenless launcher counts; but an empty or argv-less
+        # reading proves nothing either way: wait for it, never clear the record on it.
+        processes = _poll(herdr, viewer.pane_id, viewer.server_socket,
+                          lambda ps: not is_viewer(ps, config.socket, ctx.plugin_root, recorded=True)
+                          and (not ps or _unknown(ps)))
+        if is_viewer(processes, config.socket, ctx.plugin_root, recorded=True):
             return viewer
         save_state(config.state_path, None, last)      # confirmed: gone, or no longer our viewer
     for pane in herdr.panes():
-        processes = _resolved_processes(herdr, pane["pane_id"], ctx.plugin_root)
+        processes = _scan_processes(herdr, pane["pane_id"], None, config, ctx)
         if is_viewer(processes, config.socket, ctx.plugin_root):
-            return Viewer(herdr.socket_path, pane["pane_id"], pane.get("tab_id") or "", "", "bottom")
+            adopted = Viewer(herdr.socket_path, pane["pane_id"], pane.get("tab_id") or "", "", "bottom")
+            save_state(config.state_path, adopted, last)  # recorded before anything may close it
+            return adopted
     return None
 
 
@@ -188,6 +228,9 @@ def _ratio(herdr: Herdr, target: str, placement: str, config: Config) -> float:
 
 def _show(placement: str, target: str, ctx: Context, herdr: Herdr, config: Config, plugin_id: str) -> str:
     ratio = _ratio(herdr, target, placement, config)
+    # Marker first: if this action dies before the record is saved, the next one (from any herdr
+    # server) scans this server for the orphan. Replaced below by the record, or cleared.
+    save_state(config.state_path, None, placement, pending=Pending(herdr.socket_path, time.time()))
     pane = herdr.open_viewer_in_new_tab(plugin_id, ctx.workspace_id)
     try:
         moved = herdr.move_beside(pane, ctx.tab_id, target, _DIRECTION[placement], ratio)
@@ -214,6 +257,7 @@ def _notice(herdr: Herdr, body: str, title: str = "repetui") -> None:
 
 def toggle(placement: str, ctx: Context, herdr: Herdr, config: Config, *, plugin_id: str = "repetui.bar") -> str:
     with global_lock(config.lock_path):
+        _settle_pending(herdr, config, ctx)
         viewer = _current_viewer(herdr, config, ctx)
         if _in_this_tab(viewer, herdr, ctx) and viewer.placement == placement:
             _close(herdr, viewer.pane_id, viewer.server_socket)
@@ -244,6 +288,7 @@ def quit_repetui(ctx: Context, herdr: Herdr, config: Config, *, plugin_id: str =
         _notice(herdr, "Nothing to quit.", title="repetui is not running")
         return "not_running"
     with global_lock(config.lock_path):
+        _settle_pending(herdr, config, ctx)
         viewer = _current_viewer(herdr, config, ctx)
         _, last = load_state(config.state_path)
         if _in_this_tab(viewer, herdr, ctx):

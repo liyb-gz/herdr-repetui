@@ -15,6 +15,7 @@ class FakeHerdr:
     def __init__(self, sock: str, socket_path: str = "/tmp/srv-a.sock") -> None:
         self.sock, self.socket_path = sock, socket_path
         self.calls: list[tuple] = []
+        self.listed: list[str] = []                      # sockets whose panes were listed
         self.base = {(socket_path, "w1:p2"): "w1:t1", (socket_path, "w2:p1"): "w2:t1"}
         self.viewers: dict[tuple[str, str], dict] = {}
         self.next_id, self.fail_move, self.shown, self.attach_after = 10, False, True, 0
@@ -27,10 +28,17 @@ class FakeHerdr:
         return [{"argv": ["dtach", "-a", self.sock, "-E", "-z", "-r", "ctrl_l"], "cwd": "/"}]
 
     def panes(self):
+        return self._list(self.socket_path)
+
+    def panes_on(self, socket_path):
+        self.listed.append(socket_path)
+        return self._list(socket_path)
+
+    def _list(self, socket_path):
         out = [{"pane_id": p, "tab_id": t, "workspace_id": t.split(":")[0]}
-               for (s, p), t in self.base.items() if s == self.socket_path]
+               for (s, p), t in self.base.items() if s == socket_path]
         out += [{"pane_id": p, "tab_id": v["tab"], "workspace_id": v["tab"].split(":")[0]}
-                for (s, p), v in self.viewers.items() if s == self.socket_path]
+                for (s, p), v in self.viewers.items() if s == socket_path]
         return out
 
     def layout(self, pane_id):
@@ -248,11 +256,20 @@ def test_never_identified_launcher_aborts_the_action(env, monkeypatch) -> None:
 
 
 def test_process_info_without_argv_keeps_the_record(env, monkeypatch) -> None:
+    # Fix round 1 ruling: argv-less process info for the recorded viewer is unresolved -> poll, then
+    # abort with ownership_unresolved; the record is kept and nothing is opened or closed.
     config, herdr, ctx = env
     toggle("bottom", ctx, herdr, config)
+    recorded = load_state(config.state_path)[0]
+    ticks = iter(range(1000))
+    monkeypatch.setattr(actions, "_sleep", lambda s: None)
+    monkeypatch.setattr(actions, "_clock", lambda: next(ticks))
     monkeypatch.setattr(herdr, "foreground_processes", lambda pane, socket_path=None: [{"name": "dtach"}])
     herdr.calls.clear()
-    assert toggle("bottom", ctx, herdr, config) == "hidden"
+    with pytest.raises(HerdrError) as info:
+        toggle("bottom", ctx, herdr, config)
+    assert info.value.code == "ownership_unresolved"
+    assert load_state(config.state_path)[0] == recorded and kinds(herdr) == []
 
 
 def test_failed_move_closes_the_new_viewer(env) -> None:
@@ -364,6 +381,8 @@ def test_context_from_env_reads_plugin_context_with_fallbacks() -> None:
     "[1, 2]", '"x"', '{"viewer": [1]}', '{"viewer": {"pane_id": "p"}}',
     '{"viewer": {"server_socket": "/s", "pane_id": 7, "tab_id": "t", "origin_pane_id": "", "placement": "bottom"}}',
     '{"viewer": {"server_socket": "/s", "pane_id": "p", "tab_id": "t", "origin_pane_id": "", "placement": "up"}}',
+    '{"viewer": null, "last_placement": []}', '{"viewer": null, "last_placement": {}}',
+    '{"viewer": null, "last_placement": 5}',
 ])
 def test_corrupt_state_reads_as_no_record(short_dir, content) -> None:
     path = short_dir / "s.json"
@@ -470,3 +489,225 @@ def test_toggle_script_reports_failures_and_rejects_unknown_commands(short_dir, 
     assert script.main(["toggle.py", "toggle-bottom"]) == 1
     assert reported and reported[0].startswith("toggle-bottom failed:")
     assert script.main(["toggle.py", "bogus"]) == 2
+
+
+# --- fix round 1 ---
+
+from herdr_repetui.state import Pending, load_pending  # noqa: E402
+
+SRV_B = "/tmp/srv-b.sock"
+
+
+@pytest.fixture
+def no_wait(monkeypatch):
+    ticks = iter(range(10**6))
+    monkeypatch.setattr(actions, "_sleep", lambda s: None)
+    monkeypatch.setattr(actions, "_clock", lambda: next(ticks))
+
+
+def _procs_for(herdr, monkeypatch, pane_id, *answers):
+    """Make one pane report `answers` in turn (the last one repeats); count the reads."""
+    real, seq, reads = herdr.foreground_processes, list(answers), {"n": 0}
+
+    def fp(pane, socket_path=None):
+        if pane != pane_id:
+            return real(pane, socket_path)
+        reads["n"] += 1
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    monkeypatch.setattr(herdr, "foreground_processes", fp)
+    return reads
+
+
+def test_recorded_viewer_with_empty_process_list_aborts_without_clearing(env, monkeypatch, no_wait) -> None:
+    config, herdr, ctx = env
+    toggle("bottom", ctx, herdr, config)
+    recorded = load_state(config.state_path)[0]
+    reads = _procs_for(herdr, monkeypatch, recorded.pane_id, [])
+    herdr.calls.clear()
+    with pytest.raises(HerdrError) as info:
+        toggle("side", ctx, herdr, config)
+    assert info.value.code == "ownership_unresolved" and reads["n"] > 1
+    assert load_state(config.state_path)[0] == recorded and kinds(herdr) == []
+
+
+def test_recorded_viewer_without_argv_is_polled_until_resolved(env, monkeypatch, no_wait) -> None:
+    config, herdr, ctx = env
+    toggle("bottom", ctx, herdr, config)
+    recorded = load_state(config.state_path)[0]
+    reads = _procs_for(herdr, monkeypatch, recorded.pane_id, [{"name": "python3"}], [],
+                       herdr._proc("dtach"))
+    herdr.calls.clear()
+    assert toggle("bottom", ctx, herdr, config) == "hidden"
+    assert reads["n"] == 3 and kinds(herdr) == ["close", "focus"]
+
+
+def test_recorded_viewer_confirmed_gone_still_clears(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    toggle("bottom", ctx, herdr, config)
+    recorded = load_state(config.state_path)[0]
+    _procs_for(herdr, monkeypatch, recorded.pane_id, None)
+    del herdr.viewers[(herdr.socket_path, recorded.pane_id)]
+    herdr.calls.clear()
+    assert toggle("bottom", ctx, herdr, config) == "shown"
+    assert kinds(herdr) == ["open", "move"]
+
+
+def test_scan_pane_without_argv_aborts(env, monkeypatch, no_wait) -> None:
+    config, herdr, ctx = env
+    herdr.base[(herdr.socket_path, "w3:p5")] = "w3:t1"
+    reads = _procs_for(herdr, monkeypatch, "w3:p5", [{"name": "python3", "argv": None}])
+    with pytest.raises(HerdrError) as info:
+        toggle("bottom", ctx, herdr, config)
+    assert info.value.code == "ownership_unresolved" and reads["n"] > 1
+    assert "open" not in kinds(herdr)
+
+
+def test_scan_pane_with_empty_process_list_is_skipped(env, monkeypatch, no_wait) -> None:
+    config, herdr, ctx = env
+    herdr.base[(herdr.socket_path, "w3:p5")] = "w3:t1"
+    reads = _procs_for(herdr, monkeypatch, "w3:p5", [])
+    assert toggle("bottom", ctx, herdr, config) == "shown"
+    assert reads["n"] == 1 and "w3:p5" not in [c[1] for c in herdr.calls if c[0] == "close"]
+
+
+def _server_b(herdr):
+    """A second herdr server sharing the same world of panes."""
+    other = FakeHerdr(herdr.sock, SRV_B)
+    other.viewers, other.base = herdr.viewers, herdr.base
+    other.base[(SRV_B, "w1:p1")] = "w1:t1"
+    other.next_id = 50
+    return other
+
+
+def test_show_writes_the_pending_marker_before_open_and_replaces_it(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    seen = []
+    real_open = herdr.open_viewer_in_new_tab
+
+    def open_(plugin_id, workspace_id):
+        seen.append((load_state(config.state_path)[0], load_pending(config.state_path)))
+        return real_open(plugin_id, workspace_id)
+
+    monkeypatch.setattr(herdr, "open_viewer_in_new_tab", open_)
+    toggle("bottom", ctx, herdr, config)
+    assert seen[0][0] is None and seen[0][1].server_socket == herdr.socket_path
+    assert load_pending(config.state_path) is None and load_state(config.state_path)[0] is not None
+
+
+def test_interrupted_show_on_server_a_then_toggle_on_server_b_leaves_one_viewer(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+
+    def interrupted(*a):
+        raise KeyboardInterrupt                       # the action dies between open and save
+
+    monkeypatch.setattr(herdr, "move_beside", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        toggle("bottom", ctx, herdr, config)
+    assert load_state(config.state_path)[0] is None and load_pending(config.state_path) is not None
+    assert len(herdr.viewers) == 1                     # the orphan in server A's temp tab
+    orphan = next(iter(herdr.viewers))
+    b = _server_b(herdr)
+    assert toggle("bottom", Context("w1", "w1:t1", "w1:p1", SRV_B, ROOT), b, config) == "shown"
+    assert herdr.socket_path in b.listed
+    assert ("close", orphan[1], herdr.socket_path) in b.calls
+    assert len(herdr.viewers) == 1 and next(iter(herdr.viewers))[0] == SRV_B
+    assert load_pending(config.state_path) is None
+    assert load_state(config.state_path)[0].server_socket == SRV_B
+
+
+def test_pending_orphan_close_timeout_keeps_record_and_marker(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    monkeypatch.setattr(herdr, "move_beside", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        toggle("bottom", ctx, herdr, config)
+    orphan = next(iter(herdr.viewers))
+    b = _server_b(herdr)
+    monkeypatch.setattr(b, "close_viewer", lambda *a: (_ for _ in ()).throw(HerdrError("timeout", "")))
+    with pytest.raises(HerdrError):
+        toggle("bottom", Context("w1", "w1:t1", "w1:p1", SRV_B, ROOT), b, config)
+    viewer, _ = load_state(config.state_path)
+    assert (viewer.server_socket, viewer.pane_id) == orphan
+    assert load_pending(config.state_path) is not None and "open" not in kinds(b)
+
+
+def test_pending_marker_with_unreachable_server_is_cleared(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    save_state(config.state_path, None, "side", pending=Pending("/tmp/srv-gone.sock", 1.0))
+    real = herdr.panes_on
+
+    tried = []
+
+    def panes_on(socket_path):
+        tried.append(socket_path)
+        if socket_path == "/tmp/srv-gone.sock":
+            raise HerdrError("server_unreachable", socket_path)
+        return real(socket_path)
+
+    monkeypatch.setattr(herdr, "panes_on", panes_on)
+    assert toggle("bottom", ctx, herdr, config) == "shown"
+    assert tried == ["/tmp/srv-gone.sock"]
+    assert load_pending(config.state_path) is None and len(herdr.viewers) == 1
+
+
+def test_pending_marker_scan_error_keeps_marker_and_aborts(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    save_state(config.state_path, None, "side", pending=Pending(SRV_B, 1.0))
+    monkeypatch.setattr(herdr, "panes_on", lambda s: (_ for _ in ()).throw(HerdrError("bad_response", s)))
+    with pytest.raises(HerdrError) as info:
+        toggle("bottom", ctx, herdr, config)
+    assert info.value.code == "bad_response"
+    assert load_pending(config.state_path) == Pending(SRV_B, 1.0) and kinds(herdr) == []
+
+
+def test_pending_marker_scan_with_no_orphan_is_cleared(env) -> None:
+    config, herdr, ctx = env
+    b = _server_b(herdr)
+    save_state(config.state_path, None, "side", pending=Pending(SRV_B, 1.0))
+    assert toggle("bottom", ctx, herdr, config) == "shown"
+    assert SRV_B in herdr.listed and "close" not in kinds(herdr)
+    assert load_pending(config.state_path) is None
+    assert b.viewers is herdr.viewers and len(herdr.viewers) == 1
+
+
+def test_quit_settles_a_pending_marker_first(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    monkeypatch.setattr(herdr, "move_beside", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        toggle("bottom", ctx, herdr, config)
+    monkeypatch.undo()
+    monkeypatch.setattr(actions, "socket_state", lambda p: "live")
+    herdr.calls.clear()
+    assert quit_repetui(ctx, herdr, config, sleep=lambda s: None) == "quit_sent"
+    assert kinds(herdr)[:3] == ["close", "open", "move"] and len(herdr.viewers) == 1
+
+
+def test_adopted_viewer_close_timeout_keeps_it_recorded(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    herdr.attach_after = 10**6
+    herdr.viewers[(herdr.socket_path, "w3:p4")] = {"tab": "w3:t1", "state": "pending-owned", "polls": 2}
+    monkeypatch.setattr(herdr, "close_viewer", lambda *a: (_ for _ in ()).throw(HerdrError("timeout", "")))
+    with pytest.raises(HerdrError):
+        toggle("side", ctx, herdr, config)
+    viewer, _ = load_state(config.state_path)
+    assert (viewer.server_socket, viewer.pane_id) == (herdr.socket_path, "w3:p4")
+    assert "open" not in kinds(herdr)
+
+
+@pytest.mark.parametrize("pending", [
+    "[]", '"x"', "5", '{"server_socket": "/s"}', '{"server_socket": 3, "started_at": 1}',
+    '{"server_socket": "", "started_at": 1}', '{"server_socket": "/s", "started_at": "1"}',
+    '{"server_socket": "/s", "started_at": true}', '{"server_socket": "/s", "started_at": 1, "x": 1}',
+])
+def test_malformed_pending_marker_counts_as_none(short_dir, pending) -> None:
+    path = short_dir / "s.json"
+    path.write_text('{"viewer": null, "last_placement": "side", "pending": %s}' % pending)
+    assert load_pending(path) is None and load_state(path) == (None, "side")
+
+
+def test_pending_marker_round_trip(short_dir) -> None:
+    path = short_dir / "s.json"
+    save_state(path, None, "bottom", pending=Pending("/s.sock", 12.5))
+    assert load_pending(path) == Pending("/s.sock", 12.5)
+    save_state(path, None, "bottom")
+    assert load_pending(path) is None
