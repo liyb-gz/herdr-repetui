@@ -55,21 +55,40 @@ description = "Anki sidebar"
 - There is at most one bar at a time, across all tabs and herdr sessions.
   Toggling in another tab moves it there.
 - Size: a quarter of the tab height for the bottom bar, a fifth of the tab width
-  for the sidebar, with a minimum of 6 rows or 40 columns.
+  for the sidebar. The minimum of 6 rows or 40 columns is best effort: in a small
+  pane the bar can end up smaller.
 
 repetui starts on the first toggle. To quit it for real, press `q` in repetui, or
-run the `quit` action (`repetui.bar.quit`, "Quit Anki review"), which shows the
-bar where you are and then sends `q`. Whether quitting syncs first is repetui's
-own **Sync on quit** setting, in its `?` screen, along with its other settings.
+run the `quit` action ("Quit Anki review"), which shows the bar where you are and
+then sends `q`:
+
+```sh
+herdr plugin action invoke repetui.bar.quit
+```
+
+Whether quitting syncs first is repetui's own **Sync on quit** setting, in its `?`
+screen, along with its other settings.
+
+Optionally, bind `quit` to a key as well, with another `[[keys.command]]` entry.
+The key here is only an example; pick one you like that herdr doesn't use:
+
+```toml
+[[keys.command]]
+key = "prefix+alt+q"
+type = "plugin_action"
+command = "repetui.bar.quit"
+description = "Quit Anki review"
+```
 
 **Anki Desktop must stay closed while repetui runs.** They share one collection.
 If Desktop gets it first, repetui shows a retry screen instead of the card.
 
 If repetui is still running when herdr starts, for example after a herdr
 restart, the plugin tells you ("repetui is running in the background"). The
-notice is a herdr toast if toasts are on (`ui.toast.delivery` in herdr's config
-is anything but `off`, which is herdr's default), and a macOS notification
-otherwise. Errors from the toggle and quit actions are reported the same way.
+notice is a herdr toast only if `ui.toast.delivery` in herdr's config is
+`herdr`, `terminal` or `system`. Any other value, or no setting at all (herdr's
+default is `off`), counts as off. Otherwise, and also when the herdr call fails or
+reports that nothing was shown, it is a macOS notification.
 
 ## Config
 
@@ -81,7 +100,7 @@ herdr plugin config-dir repetui.bar
 ```
 
 Setting `HERDR_REPETUI_CONFIG` to a file path uses that file instead (it must
-exist). A malformed file or an invalid value is reported as an error notice.
+exist).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -92,13 +111,25 @@ exist). A malformed file or an invalid value is reported as an error notice.
 | `profile` | `""` | Anki profile. Empty leaves the choice to repetui |
 | `bottom_fraction` | `0.25` | bottom bar share of the tab height (0 to 1, exclusive) |
 | `side_fraction` | `0.2` | sidebar share of the tab width (0 to 1, exclusive) |
-| `state_dir` | `""` | where state is kept. Empty means the plugin state directory |
+| `state_dir` | `""` | Directory for the default socket (and so its lock and state files). Ignored when `socket` is set. Empty means `$HERDR_PLUGIN_STATE_DIR` |
 
-`socket`, `anki_home` and `state_dir` must be absolute paths; `~` is expanded.
-A fraction outside 0 to 1 falls back to its default. A Unix socket path must be
-shorter than 104 bytes: the default socket moves to
+`socket`, `anki_home` and `state_dir` must be absolute paths; `~` is expanded. A
+Unix socket path must be shorter than 104 bytes: the default socket moves to
 `/private/tmp/herdr-repetui-<uid>/` if the state directory is too deep, but a
 `socket` you set that is too long is an error.
+
+### Errors
+
+- A fraction that is not a number between 0 and 1 falls back to its default,
+  silently.
+- Any other bad config (a malformed file, a wrong type, a relative path, a
+  missing `HERDR_REPETUI_CONFIG` file) is an error. When the bar opens, it is
+  shown inside the bar ("press any key to close"), as is a missing `dtach` or
+  `repetui` command. In the toggle and quit
+  actions it appears as a notice, delivered as described above (herdr toast, or
+  macOS notification).
+- Other failures in those actions (herdr errors, lock timeouts) appear as a
+  notice the same way.
 
 ## How it works
 
