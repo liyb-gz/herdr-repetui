@@ -7,21 +7,44 @@ from types import SimpleNamespace
 
 import pytest
 
+from herdr_captures import CAPTURES
 from herdr_repetui.herdr import GONE_CODES, Herdr, HerdrError
 
 
+def real(label: str) -> SimpleNamespace:
+    """The verbatim exit code/stdout/stderr herdr 0.9.5 produced (see herdr_captures.py)."""
+    capture = CAPTURES[label]
+    return SimpleNamespace(returncode=capture["returncode"], stdout=capture["stdout"],
+                           stderr=capture["stderr"])
+
+
 def fake_run(responses):
+    """Fake subprocess.run. A response is a `real(...)` capture, a HerdrError (exit 1, JSON on stderr
+    like herdr), a str (raw stdout, exit 0) or a dict (JSON stdout, exit 0)."""
     calls = []
 
     def run(argv, **kwargs):
         calls.append(argv[1:])
         out = responses.pop(0)
+        if isinstance(out, SimpleNamespace):
+            return out
         if isinstance(out, HerdrError):
-            return SimpleNamespace(returncode=1, stdout="",
-                                   stderr=json.dumps({"error": {"code": out.code, "message": "x"}}))
+            body = {"error": {"code": out.code, "message": "x"}, "id": "cli:test"}
+            return SimpleNamespace(returncode=1, stdout="", stderr=json.dumps(body))
+        if isinstance(out, str):
+            return SimpleNamespace(returncode=0, stdout=out, stderr="")
         return SimpleNamespace(returncode=0, stdout=json.dumps(out), stderr="")
 
     return run, calls
+
+
+def herdr_with(*responses):
+    run, calls = fake_run(list(responses))
+    return Herdr("herdr", "/tmp/none.sock", run=run), calls
+
+
+def envelope(result_type: str, **fields) -> dict:
+    return {"id": "cli:test", "result": {**fields, "type": result_type}}
 
 
 def serve_once(path: str, reply: bytes | None, delay: float = 0.0):
@@ -53,87 +76,96 @@ def test_gone_codes_cover_missing_pane_and_unreachable_server() -> None:
     assert {"pane_not_found", "plugin_pane_not_found", "server_unreachable"} <= GONE_CODES
     assert "timeout" not in GONE_CODES and "bad_response" not in GONE_CODES
 
+# ---- CLI replies: validated per subcommand against the shapes captured from herdr 0.9.5 -------------
 
-def test_move_beside_returns_new_id_and_rejects_unchanged() -> None:
-    run, calls = fake_run([
-        {"result": {"move_result": {"changed": True, "pane": {"pane_id": "w1:p9"}}}},
-        {"result": {"move_result": {"changed": False, "reason": "same_tab", "pane": {"pane_id": "w1:p9"}}}},
-    ])
-    h = Herdr("herdr", "/tmp/none.sock", run=run)
-    assert h.move_beside("w2:p1", "w1:t1", "w1:p2", "down", 0.75) == "w1:p9"
-    assert calls[0] == ["pane", "move", "w2:p1", "--tab", "w1:t1", "--target-pane", "w1:p2",
+def test_real_pane_list_is_parsed() -> None:
+    h, calls = herdr_with(real("pane list"))
+    assert h.panes() == [
+        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+        {"pane_id": "w1:p3", "tab_id": "w1:t1", "workspace_id": "w1"},
+        {"pane_id": "w1:p4", "tab_id": "w1:t1", "workspace_id": "w1"},
+        {"pane_id": "w2:p1", "tab_id": "w2:t1", "workspace_id": "w2"}]
+    assert calls == [["pane", "list"]]
+
+
+def test_real_pane_layout_is_returned() -> None:
+    h, calls = herdr_with(real("pane layout"))
+    layout = h.layout("w1:p1")
+    assert layout["area"] == {"height": 47, "width": 134, "x": 0, "y": 0}
+    assert [p["pane_id"] for p in layout["panes"]] == ["w1:p1", "w1:p3", "w1:p4"]
+    assert calls == [["pane", "layout", "--pane", "w1:p1"]]
+
+
+def test_real_plugin_pane_open_yields_the_pane_id() -> None:
+    h, calls = herdr_with(real("plugin pane open"))
+    assert h.open_viewer_in_new_tab("spike.probe", "w1") == "w1:p7"
+    assert calls == [["plugin", "pane", "open", "--plugin", "spike.probe", "--entrypoint", "review",
+                      "--placement", "tab", "--workspace", "w1", "--no-focus"]]
+
+
+def test_real_pane_move_returns_the_kept_id_and_rejects_same_tab() -> None:
+    h, calls = herdr_with(real("pane move (cross-tab, changed)"), real("pane move (same tab, unchanged)"))
+    assert h.move_beside("w1:p7", "w1:t1", "w1:p1", "down", 0.75) == "w1:p7"
+    assert calls[0] == ["pane", "move", "w1:p7", "--tab", "w1:t1", "--target-pane", "w1:p1",
                         "--split", "down", "--ratio", "0.7500", "--focus"]
-    with pytest.raises(HerdrError):
-        h.move_beside("w1:p9", "w1:t1", "w1:p2", "down", 0.75)
-
-
-def test_move_beside_same_tab_without_pane_is_not_moved() -> None:
-    run, _ = fake_run([{"result": {"move_result": {"changed": False, "reason": "same_tab"}}},
-                       {"result": {"move_result": {"changed": True, "pane": {}}}}])
-    h = Herdr("herdr", "/tmp/none.sock", run=run)
     with pytest.raises(HerdrError) as info:
-        h.move_beside("w1:p9", "w1:t1", "w1:p2", "down", 0.75)
+        h.move_beside("w1:p7", "w1:t1", "w1:p1", "right", 0.8)
     assert info.value.code == "not_moved" and "same_tab" in str(info.value)
+
+
+def test_real_plugin_pane_close_and_its_gone_errors() -> None:
+    h, calls = herdr_with(real("plugin pane close (plugin pane)"),
+                          real("plugin pane close (again: already gone)"),
+                          real("plugin pane close (non-plugin pane)"))
+    h.close_viewer("w1:p7", h.socket_path)
+    assert calls == [["plugin", "pane", "close", "w1:p7"]]
+    for _ in range(2):
+        with pytest.raises(HerdrError) as info:
+            h.close_viewer("w1:p7", h.socket_path)
+        assert info.value.code == "plugin_pane_not_found" and info.value.code in GONE_CODES
+
+
+def test_close_viewer_rejects_a_reply_for_another_pane() -> None:
+    h, _ = herdr_with(real("plugin pane close (plugin pane)"))
     with pytest.raises(HerdrError) as info:
-        h.move_beside("w1:p9", "w1:t1", "w1:p2", "down", 0.75)
+        h.close_viewer("w1:p3", h.socket_path)  # the capture closed w1:p7
     assert info.value.code == "bad_response"
 
 
-@pytest.mark.parametrize("reply", [
-    {"result": {}},
-    {"result": {"move_result": "x"}},
-    {"result": {"move_result": {"pane": {"pane_id": "w1:p9"}}}},                         # no changed
-    {"result": {"move_result": {"changed": "false", "pane": {"pane_id": "w1:p9"}}}},     # truthy string
-    {"result": {"move_result": {"changed": 1, "pane": {"pane_id": "w1:p9"}}}},
-    {"result": {"move_result": {"changed": None, "pane": {"pane_id": "w1:p9"}}}},
-    {"result": {"move_result": {"changed": True, "pane": {"pane_id": ""}}}},
-    {"result": {"move_result": {"changed": True, "pane": "w1:p9"}}},
-    {"result": "weird"},
-    {"result": None},
-])
-def test_move_beside_rejects_unconfirmed_results(reply) -> None:
-    run, _ = fake_run([reply])
+def test_real_notification_show_reports_shown() -> None:
+    h, calls = herdr_with(real("notification show"))
+    assert h.notify("t", "b") is True
+    assert calls == [["notification", "show", "t", "--body", "b"]]
+
+
+def test_notify_reports_a_false_shown_flag() -> None:
+    h, _ = herdr_with(envelope("notification_show", shown=False, reason="disabled"),
+                      envelope("notification_show", shown="true"),
+                      envelope("notification_show", reason="shown"),
+                      envelope("something_else", shown=True))
+    assert [h.notify("t", "b") for _ in range(4)] == [False, False, False, False]
+
+
+def test_real_send_keys_success_prints_nothing_and_is_accepted() -> None:
+    h, calls = herdr_with(real("pane send-keys (plain shell pane)"))
+    assert h.send_keys("w1:p6", "q") is None
+    assert calls == [["pane", "send-keys", "w1:p6", "q"]]
+
+
+def test_real_error_replies_come_from_stderr_with_their_code() -> None:
+    h, _ = herdr_with(real("pane send-keys (missing pane)"), real("pane get (missing: error case)"))
     with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).move_beside("w1:p9", "w1:t1", "w1:p2", "down", 0.75)
-    assert info.value.code == "bad_response"
-
-
-def test_open_viewer_in_new_tab_reads_the_documented_path() -> None:
-    opened = {"result": {"plugin_pane": {"entrypoint": "p",
-                                         "pane": {"pane_id": "w1:p2", "tab_id": "w1:t2"},
-                                         "plugin_id": "repetui"},
-                         "type": "plugin_pane_opened"}}
-    run, calls = fake_run([opened])
-    h = Herdr("herdr", "/tmp/none.sock", run=run)
-    assert h.open_viewer_in_new_tab("repetui", "w1") == "w1:p2"
-    assert calls[0] == ["plugin", "pane", "open", "--plugin", "repetui", "--entrypoint", "review",
-                        "--placement", "tab", "--workspace", "w1", "--no-focus"]
-
-
-@pytest.mark.parametrize("reply", [
-    {"result": {"type": "pane_info", "pane": {"pane_id": "w1:p2"}}},                     # some other command's shape
-    {"result": {"type": "plugin_pane_opened"}},
-    {"result": {"type": "plugin_pane_opened", "plugin_pane": {"pane": {}}}},
-    {"result": {"type": "plugin_pane_opened", "plugin_pane": {"pane": {"pane_id": ""}}}},
-    {"result": {"type": "plugin_pane_opened", "plugin_pane": {"pane": {"pane_id": 7}}}},
-    {"result": {"type": "plugin_pane_opened", "plugin_pane": "w1:p2"}},
-    {"result": {"plugin_pane": {"pane": {"pane_id": "w1:p2"}}}},                         # type missing
-    {"result": {"type": "other", "plugin_pane": {"pane": {"pane_id": "w1:p2"}}}},
-    {"result": {"nested": {"pane": {"pane_id": "w1:p2"}}, "type": "plugin_pane_opened"}},  # no recursive search
-    {"result": "weird"},
-    {},
-])
-def test_open_viewer_in_new_tab_rejects_unconfirmed_results(reply) -> None:
-    run, _ = fake_run([reply])
+        h.send_keys("w999:p999", "q")
+    assert info.value.code == "pane_not_found" and info.value.code in GONE_CODES
     with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).open_viewer_in_new_tab("repetui", "w1")
-    assert info.value.code == "bad_response"
+        h.cli("pane", "get", "w999:p999")
+    assert info.value.code == "pane_not_found"
 
 
 def test_cli_error_and_timeout() -> None:
-    run, _ = fake_run([HerdrError("pane_not_found", "x")])
+    h, _ = herdr_with(HerdrError("pane_not_found", "x"))
     with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).cli("pane", "get", "w1:p1")
+        h.cli("pane", "get", "w1:p1")
     assert info.value.code == "pane_not_found"
 
     def slow(*a, **k):
@@ -143,17 +175,228 @@ def test_cli_error_and_timeout() -> None:
         Herdr("herdr", "/tmp/none.sock", run=slow).cli("pane", "list")
     assert info.value.code == "timeout"
 
+    def missing(*a, **k):
+        raise FileNotFoundError("herdr")
 
-def test_close_viewer_validates_result() -> None:
-    run, _ = fake_run([{"result": {"type": "plugin_pane_closed", "pane_id": "w1:p3"}},
-                       {"result": {"type": "something_else", "pane_id": "w1:p3"}},
-                       {"result": {"type": "plugin_pane_closed"}},
-                       {"result": {"type": "plugin_pane_closed", "pane_id": "w1:p4"}}])
-    h = Herdr("herdr", "/tmp/none.sock", run=run)
-    h.close_viewer("w1:p3", "/tmp/none.sock")
+    with pytest.raises(HerdrError) as info:
+        Herdr("nope", "/tmp/none.sock", run=missing).cli("pane", "list")
+    assert info.value.code == "no_herdr"
+
+
+# Every JSON-printing subcommand uses the envelope class: exit 0 and exactly one of result/error.
+ENVELOPE_CALLS = {
+    "pane list": lambda h: h.panes(),
+    "pane layout": lambda h: h.layout("w1:p1"),
+    "plugin pane open": lambda h: h.open_viewer_in_new_tab("spike.probe", "w1"),
+    "pane move": lambda h: h.move_beside("w1:p7", "w1:t1", "w1:p1", "down", 0.75),
+    "plugin pane close": lambda h: h.close_viewer("w1:p7", h.socket_path),
+    "raw cli": lambda h: h.cli("pane", "get", "w1:p1"),
+}
+
+UNCONFIRMED_STDOUT = {
+    "empty": "",
+    "whitespace": "  \n",
+    "empty object": "{}",
+    "unrelated key": '{"unrelated":1}',
+    "id only": '{"id":"cli:test"}',
+    "result is null": '{"id":"cli:test","result":null}',
+    "result is a string": '{"id":"cli:test","result":"ok"}',
+    "result is a list": '{"id":"cli:test","result":[]}',
+    "both result and error": '{"id":"cli:test","result":{"type":"x"},"error":{"code":"pane_not_found","message":"m"}}',
+    "error is a string": '{"id":"cli:test","error":"boom"}',
+    "error without code": '{"id":"cli:test","error":{"message":"m"}}',
+    "plain text": "No plugins installed.",
+    "json list": "[1,2]",
+    "json string": '"ok"',
+    "json null": "null",
+    "truncated json": '{"id":"cli:test","result":{"type":',
+}
+
+
+@pytest.mark.parametrize("stdout", list(UNCONFIRMED_STDOUT.values()), ids=list(UNCONFIRMED_STDOUT))
+@pytest.mark.parametrize("call", list(ENVELOPE_CALLS.values()), ids=list(ENVELOPE_CALLS))
+def test_envelope_subcommands_reject_unconfirmed_exit_zero_output(call, stdout) -> None:
+    h, _ = herdr_with(stdout)
+    with pytest.raises(HerdrError) as info:
+        call(h)
+    assert info.value.code == "bad_response"
+
+
+@pytest.mark.parametrize("call", list(ENVELOPE_CALLS.values()), ids=list(ENVELOPE_CALLS))
+def test_envelope_subcommands_raise_the_code_of_an_exit_zero_error(call) -> None:
+    h, _ = herdr_with('{"error":{"code":"pane_not_found","message":"gone"},"id":"cli:test"}')
+    with pytest.raises(HerdrError) as info:
+        call(h)
+    assert info.value.code == "pane_not_found"
+
+
+@pytest.mark.parametrize("stdout", list(UNCONFIRMED_STDOUT.values())[:6], ids=list(UNCONFIRMED_STDOUT)[:6])
+def test_notify_treats_unconfirmed_output_as_not_shown(stdout) -> None:
+    h, _ = herdr_with(stdout)
+    assert h.notify("t", "b") is False
+
+
+def test_notify_does_not_hide_transport_errors_or_exit_zero_errors() -> None:
+    h, _ = herdr_with(HerdrError("timeout", "x"),
+                      '{"error":{"code":"server_unreachable","message":"m"},"id":"cli:test"}')
+    for code in ("timeout", "server_unreachable"):
+        with pytest.raises(HerdrError) as info:
+            h.notify("t", "b")
+        assert info.value.code == code
+
+
+@pytest.mark.parametrize("stdout", [s for k, s in UNCONFIRMED_STDOUT.items() if k not in ("empty", "whitespace")],
+                         ids=[k for k in UNCONFIRMED_STDOUT if k not in ("empty", "whitespace")])
+def test_send_keys_accepts_only_empty_output(stdout) -> None:
+    h, _ = herdr_with(stdout)
+    with pytest.raises(HerdrError) as info:
+        h.send_keys("w1:p6", "q")
+    assert info.value.code == "bad_response"
+
+
+def test_send_keys_exit_zero_with_error_raises_its_code() -> None:
+    h, _ = herdr_with('{"error":{"code":"pane_not_found","message":"gone"},"id":"cli:test"}')
+    with pytest.raises(HerdrError) as info:
+        h.send_keys("w999:p999", "q")
+    assert info.value.code == "pane_not_found"
+
+
+def test_send_keys_empty_output_with_a_failing_exit_still_raises() -> None:
+    h, _ = herdr_with(SimpleNamespace(returncode=1, stdout="", stderr=""))
+    with pytest.raises(HerdrError) as info:
+        h.send_keys("w1:p6", "q")
+    assert info.value.code == "cli_failed"
+
+
+def test_empty_output_is_only_accepted_when_the_caller_opts_in() -> None:
+    h, _ = herdr_with("", "")
+    assert h.cli("pane", "send-keys", "w1:p1", "q", empty_ok=True) == {}
+    with pytest.raises(HerdrError) as info:
+        h.cli("pane", "send-keys", "w1:p1", "q")
+    assert info.value.code == "bad_response"
+
+
+@pytest.mark.parametrize("reply", [
+    envelope("pane_info", pane={"pane_id": "w1:p2"}),     # another command's shape
+    envelope("plugin_pane_opened_x"),
+    {"id": "cli:test", "result": {"plugin_pane": {"pane": {"pane_id": "w1:p2"}}}},   # no type
+])
+@pytest.mark.parametrize("call", [ENVELOPE_CALLS[k] for k in
+                                  ("pane list", "pane layout", "plugin pane open", "pane move",
+                                   "plugin pane close")])
+def test_envelope_subcommands_check_the_result_type(call, reply) -> None:
+    h, _ = herdr_with(reply)
+    with pytest.raises(HerdrError) as info:
+        call(h)
+    assert info.value.code == "bad_response"
+
+
+@pytest.mark.parametrize("stderr", [
+    json.dumps({"error": "boom", "id": "x"}),
+    json.dumps({"error": None, "id": "x"}),
+    json.dumps({"error": ["pane_not_found"], "id": "x"}),
+    json.dumps({"error": {"message": "no code"}, "id": "x"}),
+    json.dumps({"error": {"code": "pane_not_found", "message": "x"}, "result": {}, "id": "x"}),
+])
+def test_cli_failure_with_malformed_or_contradictory_error_is_bad_response(stderr) -> None:
+    h, _ = herdr_with(SimpleNamespace(returncode=1, stdout="", stderr=stderr))
+    with pytest.raises(HerdrError) as info:
+        h.cli("pane", "get", "w1:p1")
+    assert info.value.code == "bad_response"
+
+
+@pytest.mark.parametrize("stderr", ["", "Segmentation fault", "[1,2]", '{"msg":"no error key"}'])
+def test_cli_failure_without_error_object_is_cli_failed(stderr) -> None:
+    h, _ = herdr_with(SimpleNamespace(returncode=2, stdout="", stderr=stderr))
+    with pytest.raises(HerdrError) as info:
+        h.cli("pane", "get", "w1:p1")
+    assert info.value.code == "cli_failed"
+
+
+def test_move_beside_rejects_unchanged_and_bad_move_results() -> None:
+    def moved(**move) -> dict:
+        return envelope("pane_move", move_result=move)
+
+    h, _ = herdr_with(
+        moved(changed=False, reason="same_tab", pane={"pane_id": "w1:p9"}),
+        moved(changed=False),
+        moved(changed=True, pane={}),
+        moved(changed=True, pane={"pane_id": ""}),
+        moved(changed=True, pane="w1:p9"),
+        moved(pane={"pane_id": "w1:p9"}),
+        moved(changed="false", pane={"pane_id": "w1:p9"}),
+        moved(changed=1, pane={"pane_id": "w1:p9"}),
+        moved(changed=None, pane={"pane_id": "w1:p9"}),
+        envelope("pane_move", move_result="x"),
+        envelope("pane_move"),
+    )
+    expected = ["not_moved", "not_moved"] + ["bad_response"] * 9
+    for code in expected:
+        with pytest.raises(HerdrError) as info:
+            h.move_beside("w1:p9", "w1:t1", "w1:p2", "down", 0.75)
+        assert info.value.code == code
+
+
+def test_open_viewer_rejects_unconfirmed_pane_ids() -> None:
+    def opened(**fields) -> dict:
+        return envelope("plugin_pane_opened", **fields)
+
+    h, _ = herdr_with(
+        opened(),
+        opened(plugin_pane={"pane": {}}),
+        opened(plugin_pane={"pane": {"pane_id": ""}}),
+        opened(plugin_pane={"pane": {"pane_id": 7}}),
+        opened(plugin_pane="w1:p2"),
+        opened(nested={"pane": {"pane_id": "w1:p2"}}),     # no recursive search
+        envelope("pane_info", pane={"pane_id": "w1:p2"}),   # the pane_info shape of other commands
+    )
+    for _ in range(7):
+        with pytest.raises(HerdrError) as info:
+            h.open_viewer_in_new_tab("spike.probe", "w1")
+        assert info.value.code == "bad_response"
+
+
+@pytest.mark.parametrize("panes", [
+    None, "w1:p1", {"pane_id": "w1:p1"}, ["w1:p1"], [None], [{"tab_id": "w1:t1"}], [{"pane_id": 7}],
+    [{"pane_id": "w1:p1"}, {"pane_id": None}], [{"pane_id": "w1:p1", "tab_id": 3}],
+    [{"pane_id": "w1:p1", "workspace_id": ["w1"]}],
+])
+def test_panes_rejects_a_malformed_listing(panes) -> None:
+    h, _ = herdr_with(envelope("pane_list", panes=panes), envelope("pane_list"))
+    with pytest.raises(HerdrError) as info:
+        h.panes()
+    assert info.value.code == "bad_response"
+    with pytest.raises(HerdrError) as info:      # panes missing altogether is not an empty listing
+        Herdr("herdr", "/tmp/none.sock", run=fake_run([envelope("pane_list")])[0]).panes()
+    assert info.value.code == "bad_response"
+
+
+def test_panes_normalises_optional_ids() -> None:
+    h, _ = herdr_with(envelope("pane_list", panes=[{"pane_id": "w2:p1", "extra": 1}]))
+    assert h.panes() == [{"pane_id": "w2:p1", "tab_id": None, "workspace_id": None}]
+
+
+@pytest.mark.parametrize("layout", [
+    None, [], "x", {"panes": []}, {"area": {}}, {"area": [], "panes": []}, {"area": {}, "panes": {}},
+    {"area": None, "panes": None},
+])
+def test_layout_rejects_a_malformed_layout(layout) -> None:
+    h, _ = herdr_with(envelope("pane_layout", layout=layout), envelope("pane_layout"))
+    with pytest.raises(HerdrError) as info:
+        h.layout("w1:p1")
+    assert info.value.code == "bad_response"
+    with pytest.raises(HerdrError) as info:
+        h.layout("w1:p1")
+    assert info.value.code == "bad_response"
+
+
+def test_close_viewer_rejects_missing_or_other_pane_ids() -> None:
+    h, _ = herdr_with(envelope("plugin_pane_closed"), envelope("plugin_pane_closed", pane_id="w1:p4"),
+                      envelope("something_else", pane_id="w1:p3"))
     for _ in range(3):
-        with pytest.raises(HerdrError):
-            h.close_viewer("w1:p3", "/tmp/none.sock")
+        with pytest.raises(HerdrError) as info:
+            h.close_viewer("w1:p3", h.socket_path)
+        assert info.value.code == "bad_response"
 
 
 def test_close_viewer_on_foreign_socket_uses_raw_request(short_dir) -> None:
@@ -167,13 +410,6 @@ def test_close_viewer_on_foreign_socket_uses_raw_request(short_dir) -> None:
     finally:
         t.join()
         Path(path).unlink(missing_ok=True)
-
-
-def test_close_viewer_reports_plugin_pane_not_found_as_gone_code() -> None:
-    run, _ = fake_run([HerdrError("plugin_pane_not_found", "x")])
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).close_viewer("w1:p3", "/tmp/none.sock")
-    assert info.value.code in GONE_CODES
 
 
 def test_process_info_validates_type_and_pane(short_dir) -> None:
@@ -214,15 +450,6 @@ def test_process_info_gone_pane_is_none_but_timeout_raises(short_dir) -> None:
         t.join()
         Path(path).unlink(missing_ok=True)
     assert Herdr("herdr", str(short_dir / "missing.sock")).foreground_processes("w1:p1") is None
-
-
-def test_notify_reports_shown_flag() -> None:
-    run, _ = fake_run([{"result": {"type": "notification_show", "shown": False, "reason": "disabled"}},
-                       {"result": "weird"}, ["not", "a", "dict"],
-                       {"result": {"type": "notification_show", "shown": True}}])
-    h = Herdr("herdr", "/tmp/none.sock", run=run)
-    assert h.notify("t", "b") is False and h.notify("t", "b") is False and h.notify("t", "b") is False
-    assert h.notify("t", "b") is True
 
 
 def test_request_ok(short_dir) -> None:
@@ -381,132 +608,3 @@ def test_contradictory_envelope_never_reads_as_a_gone_pane(short_dir) -> None:
         assert info.value.code == "bad_response"
     finally:
         finish(path, t)
-
-
-def test_cli_with_both_result_and_error_is_bad_response() -> None:
-    both = {"result": {"type": "plugin_pane_closed", "pane_id": "w1:p3"},
-            "error": {"code": "plugin_pane_not_found", "message": "x"}}
-    run, _ = fake_run([both])
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).cli("plugin", "pane", "close", "w1:p3")
-    assert info.value.code == "bad_response"
-
-
-def test_cli_failure_with_both_result_and_error_is_bad_response() -> None:
-    def run(argv, **kwargs):
-        body = {"result": {}, "error": {"code": "pane_not_found", "message": "x"}}
-        return SimpleNamespace(returncode=1, stdout="", stderr=json.dumps(body))
-
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).cli("pane", "get", "w1:p1")
-    assert info.value.code == "bad_response"
-
-
-def test_cli_exit_zero_with_error_member_raises_that_error() -> None:
-    run, _ = fake_run([{"error": {"code": "pane_not_found", "message": "gone"}}])
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).cli("pane", "get", "w1:p1")
-    assert info.value.code == "pane_not_found"
-
-
-@pytest.mark.parametrize("stderr", [
-    json.dumps({"error": "boom"}),
-    json.dumps({"error": None}),
-    json.dumps({"error": ["pane_not_found"]}),
-    json.dumps({"error": {"message": "no code"}}),
-])
-def test_cli_failure_with_malformed_error_member_is_bad_response(stderr) -> None:
-    def run(argv, **kwargs):
-        return SimpleNamespace(returncode=1, stdout="", stderr=stderr)
-
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).cli("pane", "get", "w1:p1")
-    assert info.value.code == "bad_response"
-
-
-@pytest.mark.parametrize("stderr", ["", "Segmentation fault", "[1,2]", '{"msg":"no error key"}'])
-def test_cli_failure_without_error_object_is_cli_failed(stderr) -> None:
-    def run(argv, **kwargs):
-        return SimpleNamespace(returncode=2, stdout="", stderr=stderr)
-
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).cli("pane", "get", "w1:p1")
-    assert info.value.code == "cli_failed"
-
-
-@pytest.mark.parametrize("stdout", ["not json", "[1,2]", '"text"', "7", "null"])
-def test_cli_rejects_non_object_output(stdout) -> None:
-    def run(argv, **kwargs):
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
-
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).cli("pane", "list")
-    assert info.value.code == "bad_response"
-
-
-def test_panes_normalises_and_validates() -> None:
-    listed = {"result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1", "extra": 1},
-                                   {"pane_id": "w2:p1"}]}}
-    run, calls = fake_run([listed])
-    assert Herdr("herdr", "/tmp/none.sock", run=run).panes() == [
-        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
-        {"pane_id": "w2:p1", "tab_id": None, "workspace_id": None}]
-    assert calls == [["pane", "list"]]
-
-
-@pytest.mark.parametrize("reply", [
-    {}, {"result": None}, {"result": "weird"}, {"result": {}},
-    {"result": {"panes": None}}, {"result": {"panes": "w1:p1"}}, {"result": {"panes": {"pane_id": "w1:p1"}}},
-    {"result": {"panes": ["w1:p1"]}}, {"result": {"panes": [None]}},
-    {"result": {"panes": [{"tab_id": "w1:t1"}]}},
-    {"result": {"panes": [{"pane_id": 7}]}},
-    {"result": {"panes": [{"pane_id": "w1:p1"}, {"pane_id": None}]}},
-    {"result": {"panes": [{"pane_id": "w1:p1", "tab_id": 3}]}},
-    {"result": {"panes": [{"pane_id": "w1:p1", "workspace_id": ["w1"]}]}},
-])
-def test_panes_rejects_malformed_listing(reply) -> None:
-    run, _ = fake_run([reply])
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).panes()
-    assert info.value.code == "bad_response"
-
-
-def test_layout_returns_the_layout_object() -> None:
-    layout = {"area": {"width": 100, "height": 40}, "panes": [{"pane_id": "w1:p1"}], "splits": []}
-    run, calls = fake_run([{"result": {"layout": layout}}])
-    assert Herdr("herdr", "/tmp/none.sock", run=run).layout("w1:p1") == layout
-    assert calls == [["pane", "layout", "--pane", "w1:p1"]]
-
-
-@pytest.mark.parametrize("reply", [
-    {}, {"result": None}, {"result": "weird"}, {"result": {}},
-    {"result": {"layout": None}}, {"result": {"layout": []}}, {"result": {"layout": "x"}},
-    {"result": {"layout": {"panes": []}}},                               # no area
-    {"result": {"layout": {"area": {}}}},                                # no panes
-    {"result": {"layout": {"area": [], "panes": []}}},
-    {"result": {"layout": {"area": {}, "panes": {}}}},
-    {"result": {"layout": {"area": None, "panes": None}}},
-])
-def test_layout_rejects_malformed_layout(reply) -> None:
-    run, _ = fake_run([reply])
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).layout("w1:p1")
-    assert info.value.code == "bad_response"
-
-
-def test_close_viewer_rejects_malformed_and_contradictory_cli_replies() -> None:
-    run, _ = fake_run([{"result": "weird"}, {},
-                       {"result": {"type": "plugin_pane_closed", "pane_id": "w1:p3"},
-                        "error": {"code": "plugin_pane_not_found", "message": "x"}}])
-    h = Herdr("herdr", "/tmp/none.sock", run=run)
-    for _ in range(3):
-        with pytest.raises(HerdrError) as info:
-            h.close_viewer("w1:p3", "/tmp/none.sock")
-        assert info.value.code == "bad_response"
-
-
-def test_notify_still_raises_transport_errors_but_not_shape_errors() -> None:
-    run, _ = fake_run([HerdrError("timeout", "x")])
-    with pytest.raises(HerdrError) as info:
-        Herdr("herdr", "/tmp/none.sock", run=run).notify("t", "b")
-    assert info.value.code == "timeout"

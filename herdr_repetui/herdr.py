@@ -31,6 +31,14 @@ def _need_dict(value: object, what: str) -> dict:
     return value
 
 
+def _result_of(envelope: object, result_type: str, what: str) -> dict:
+    """The `result` object of a validated envelope, which must be of the observed `type`."""
+    result = _need_dict(_need_dict(envelope, what).get("result"), f"{what} result")
+    if result.get("type") != result_type:
+        raise _bad(f"{what}: expected result type {result_type!r}, got {result.get('type')!r}")
+    return result
+
+
 def _error_from_value(error: object, what: str) -> HerdrError:
     """Build the HerdrError for a parsed `error` member; a malformed one is bad_response."""
     if not isinstance(error, dict):
@@ -76,27 +84,44 @@ class Herdr:
         self._run = run
         self._timeout = timeout
 
-    def cli(self, *args: str) -> dict:
+    def cli(self, *args: str, empty_ok: bool = False) -> dict:
+        """Run `herdr <args>` and return its envelope `{"id", "result": {...}}`.
+
+        herdr 0.9.5 (captured in the spike notes, "CLI output shapes"): a successful call prints one
+        JSON object on stdout with exactly one of `result`/`error`; a failed call exits 1 with
+        `{"error": {"code", "message"}, "id"}` on stderr. Anything else on exit 0 (empty, non-JSON,
+        neither key, both keys, a non-object result) is bad_response, so an unconfirmed reply never
+        counts as success. The one observed exception is `pane send-keys`, which prints nothing on
+        success: pass empty_ok=True for that call only; empty output then returns {}.
+        """
+        what = f"herdr {' '.join(args[:2])}"
         try:
             proc = self._run([self.bin_path, *args], capture_output=True, text=True, timeout=15)
         except subprocess.TimeoutExpired as exc:
-            raise HerdrError("timeout", f"herdr {' '.join(args[:2])}") from exc
+            raise HerdrError("timeout", what) from exc
         except FileNotFoundError as exc:
             raise HerdrError("no_herdr", str(exc)) from exc
         if proc.returncode != 0:
             raise _error_from(proc.stderr or proc.stdout)
         if not proc.stdout.strip():
-            return {}
+            if empty_ok:
+                return {}
+            raise _bad(f"{what}: empty output")
         try:
             parsed = json.loads(proc.stdout)
         except ValueError as exc:
-            raise _bad(proc.stdout[:200]) from exc
+            raise _bad(f"{what}: output is not JSON: {proc.stdout[:200]}") from exc
         if not isinstance(parsed, dict):
-            raise _bad(f"herdr {' '.join(args[:2])}: output is not an object")
-        if "error" in parsed:
-            if "result" in parsed:
-                raise _bad(f"herdr {' '.join(args[:2])}: both result and error")
-            raise _error_from_value(parsed["error"], f"herdr {' '.join(args[:2])}")
+            raise _bad(f"{what}: output is not an object")
+        has_result, has_error = "result" in parsed, "error" in parsed
+        if has_result and has_error:
+            raise _bad(f"{what}: both result and error")
+        if has_error:
+            raise _error_from_value(parsed["error"], what)
+        if not has_result:
+            raise _bad(f"{what}: neither result nor error")
+        if not isinstance(parsed["result"], dict):
+            raise _bad(f"{what}: result is not an object")
         return parsed
 
     def request(self, method: str, params: dict, *, socket_path: str | None = None) -> dict:
@@ -139,10 +164,8 @@ class Herdr:
     def open_viewer_in_new_tab(self, plugin_id: str, workspace_id: str) -> str:
         envelope = self.cli("plugin", "pane", "open", "--plugin", plugin_id, "--entrypoint", "review",
                             "--placement", "tab", "--workspace", workspace_id, "--no-focus")
-        # schema: {"result": {"type": "plugin_pane_opened", "plugin_pane": {"pane": {"pane_id": ...}}}}
-        result = _need_dict(envelope.get("result"), "plugin pane open result")
-        if result.get("type") != "plugin_pane_opened":
-            raise _bad(f"plugin pane open: unexpected result type {result.get('type')!r}")
+        # {"id", "result": {"type": "plugin_pane_opened", "plugin_pane": {"entrypoint", "pane": {...}, "plugin_id"}}}
+        result = _result_of(envelope, "plugin_pane_opened", "plugin pane open")
         plugin_pane = _need_dict(result.get("plugin_pane"), "plugin pane open plugin_pane")
         pane = _need_dict(plugin_pane.get("pane"), "plugin pane open pane")
         pane_id = pane.get("pane_id")
@@ -153,8 +176,8 @@ class Herdr:
     def move_beside(self, pane_id: str, tab_id: str, target_pane_id: str, direction: str, ratio: float) -> str:
         envelope = self.cli("pane", "move", pane_id, "--tab", tab_id, "--target-pane", target_pane_id,
                             "--split", direction, "--ratio", f"{ratio:.4f}", "--focus")
-        # schema: {"result": {"move_result": {"changed": bool, "pane": {"pane_id": ...}, "reason"?}}}
-        result = _need_dict(envelope.get("result"), "pane move result")
+        # {"id", "result": {"type": "pane_move", "move_result": {"changed": bool, "pane": {...}, "reason"?, ...}}}
+        result = _result_of(envelope, "pane_move", "pane move")
         move = _need_dict(result.get("move_result"), "pane move move_result")
         changed = move.get("changed")
         if not isinstance(changed, bool):
@@ -171,11 +194,10 @@ class Herdr:
             envelope = self.cli("plugin", "pane", "close", pane_id)
         else:
             envelope = self.request("plugin.pane.close", {"pane_id": pane_id}, socket_path=socket_path)
-        result = envelope.get("result")
-        # schema: {"type": "plugin_pane_closed", "pane_id": ...}, both required
-        if (not isinstance(result, dict) or result.get("type") != "plugin_pane_closed"
-                or result.get("pane_id") != pane_id):
-            raise _bad(f"plugin.pane.close: {str(envelope)[:200]}")
+        # {"id", "result": {"type": "plugin_pane_closed", "pane_id": ...}}, both fields required
+        result = _result_of(envelope, "plugin_pane_closed", "plugin.pane.close")
+        if result.get("pane_id") != pane_id:
+            raise _bad(f"plugin.pane.close: closed {result.get('pane_id')!r}, expected {pane_id!r}")
 
     def focus(self, pane_id: str) -> None:
         self.request("pane.focus", {"pane_id": pane_id})
@@ -200,8 +222,9 @@ class Herdr:
 
     def panes(self) -> list[dict]:
         # `pane list` without --workspace covers all workspaces (verified on herdr 0.9.5)
-        envelope = self.cli("pane", "list")
-        listed = _need_dict(envelope.get("result"), "pane list result").get("panes")
+        # {"id", "result": {"type": "pane_list", "panes": [{"pane_id", "tab_id", "workspace_id", ...}]}}
+        result = _result_of(self.cli("pane", "list"), "pane_list", "pane list")
+        listed = result.get("panes")
         if not isinstance(listed, list):
             raise _bad("pane list: panes is not a list")
         panes = []
@@ -216,22 +239,24 @@ class Herdr:
         return panes
 
     def layout(self, pane_id: str) -> dict:
-        envelope = self.cli("pane", "layout", "--pane", pane_id)
-        layout = _need_dict(_need_dict(envelope.get("result"), "pane layout result").get("layout"),
-                            "pane layout layout")
+        # {"id", "result": {"type": "pane_layout", "layout": {"area": {...}, "panes": [...], "splits": [...]}}}
+        result = _result_of(self.cli("pane", "layout", "--pane", pane_id), "pane_layout", "pane layout")
+        layout = _need_dict(result.get("layout"), "pane layout layout")
         if not isinstance(layout.get("area"), dict) or not isinstance(layout.get("panes"), list):
             raise _bad("pane layout: layout needs an area object and a panes list")
         return layout
 
     def notify(self, title: str, body: str) -> bool:
+        # {"id", "result": {"type": "notification_show", "shown": bool, "reason": str}}
         try:
-            envelope = self.cli("notification", "show", title, "--body", body)
+            result = _result_of(self.cli("notification", "show", title, "--body", body),
+                                "notification_show", "notification show")
         except HerdrError as exc:
             if exc.code == "bad_response":  # unconfirmed, so not "shown"; transport errors still raise
                 return False
             raise
-        result = envelope.get("result")
-        return isinstance(result, dict) and result.get("shown") is True
+        return result.get("shown") is True
 
     def send_keys(self, pane_id: str, *keys: str) -> None:
-        self.cli("pane", "send-keys", pane_id, *keys)
+        # prints nothing on success (exit 0, empty stdout and stderr); failures exit 1 with JSON on stderr
+        self.cli("pane", "send-keys", pane_id, *keys, empty_ok=True)
