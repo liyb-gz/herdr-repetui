@@ -1,0 +1,32 @@
+id = "repetui.bar"
+name = "repetui bar"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Anki review (repetui) as a toggleable bottom bar or sidebar"
+platforms = ["macos", "linux"]
+
+[[startup]]
+command = ["python3", "toggle.py", "startup"]
+
+[[actions]]
+id = "toggle-bottom"
+title = "Anki bottom bar"
+contexts = ["workspace"]
+command = ["python3", "toggle.py", "toggle-bottom"]
+
+[[actions]]
+id = "toggle-side"
+title = "Anki sidebar"
+contexts = ["workspace"]
+command = ["python3", "toggle.py", "toggle-side"]
+
+[[actions]]
+id = "quit"
+title = "Quit Anki review"
+contexts = ["workspace"]
+command = ["python3", "toggle.py", "quit"]
+
+[[panes]]
+id = "review"
+title = "repetui"
+command = ["python3", "launch.py"]
