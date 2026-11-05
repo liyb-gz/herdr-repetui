@@ -21,3 +21,8 @@ def test_minimum_applies() -> None:
 def test_clamped() -> None:
     for r in (split_ratio(0.25, 74, 8, 6), split_ratio(0.01, 74, 74, 1), split_ratio(0.2, 10, 0, 40)):
         assert 0.1 <= r <= 0.9
+
+
+def test_unknown_target_size_splits_in_half() -> None:
+    assert split_ratio(0.25, 74, 0, 6) == 0.5
+    assert split_ratio(0.25, 74, -3, 6) == 0.5

@@ -3,7 +3,7 @@ name = "repetui bar"
 version = "0.1.0"
 min_herdr_version = "0.9.5"
 description = "Anki review (repetui) as a toggleable bottom bar or sidebar"
-platforms = ["macos", "linux"]
+platforms = ["macos"]
 
 [[startup]]
 command = ["python3", "toggle.py", "startup"]

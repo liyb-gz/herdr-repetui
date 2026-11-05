@@ -70,3 +70,96 @@ def test_herdr_config_path_resolution(tmp_path) -> None:
 def test_explicit_socket_too_long_is_rejected(tmp_path) -> None:
     with pytest.raises(ConfigError):
         load_config(write(tmp_path, f'socket = "/tmp/{"x" * 120}.sock"\n'))
+
+
+def test_same_long_state_dir_hashes_to_the_same_socket(tmp_path) -> None:
+    env = {"HERDR_PLUGIN_STATE_DIR": str(tmp_path / ("a" * 120))}
+    assert load_config(env).socket == load_config(dict(env)).socket
+
+
+def test_invalid_toml_is_a_config_error(tmp_path) -> None:
+    env = write(tmp_path, "profile = \n")
+    with pytest.raises(ConfigError) as info:
+        load_config(env)
+    assert str(tmp_path / "c.toml") in str(info.value)
+
+
+def test_non_utf8_config_is_a_config_error(tmp_path) -> None:
+    (tmp_path / "c.toml").write_bytes(b"profile = '\xff\xfe'\n")
+    env = {"HERDR_REPETUI_CONFIG": str(tmp_path / "c.toml"), "HERDR_PLUGIN_STATE_DIR": str(tmp_path / "s")}
+    with pytest.raises(ConfigError):
+        load_config(env)
+
+
+def test_unreadable_config_is_a_config_error(tmp_path) -> None:
+    (tmp_path / "c.toml").mkdir()  # a directory where the file should be
+    with pytest.raises(ConfigError):
+        load_config({"HERDR_REPETUI_CONFIG": str(tmp_path / "c.toml"),
+                     "HERDR_PLUGIN_STATE_DIR": str(tmp_path / "s")})
+    (tmp_path / "cfg").mkdir()
+    (tmp_path / "cfg" / "config.toml").mkdir()
+    with pytest.raises(ConfigError):
+        load_config({"HERDR_PLUGIN_CONFIG_DIR": str(tmp_path / "cfg"),
+                     "HERDR_PLUGIN_STATE_DIR": str(tmp_path / "s")})
+
+
+def test_explicit_config_file_must_exist(tmp_path) -> None:
+    with pytest.raises(ConfigError):
+        load_config({"HERDR_REPETUI_CONFIG": str(tmp_path / "missing.toml"),
+                     "HERDR_PLUGIN_STATE_DIR": str(tmp_path / "s")})
+
+
+def test_missing_file_in_plugin_config_dir_is_optional(tmp_path) -> None:
+    (tmp_path / "cfg").mkdir()
+    cfg = load_config({"HERDR_PLUGIN_CONFIG_DIR": str(tmp_path / "cfg"),
+                       "HERDR_PLUGIN_STATE_DIR": str(tmp_path / "s")})
+    assert cfg.repetui == "repetui"
+    cfg = load_config({"HERDR_PLUGIN_CONFIG_DIR": str(tmp_path / "no-such-dir"),
+                       "HERDR_PLUGIN_STATE_DIR": str(tmp_path / "s")})
+    assert cfg.repetui == "repetui"
+
+
+@pytest.mark.parametrize("line", [
+    "repetui = 5",
+    "dtach = true",
+    "profile = 1",
+    "socket = 3",
+    "anki_home = 7",
+    "state_dir = 9",
+    'repetui = ""',
+    'dtach = ""',
+    'anki_home = ""',
+    'socket = "relative.sock"',
+    'anki_home = "relative/Anki2"',
+    'state_dir = "relative/state"',
+])
+def test_invalid_values_are_config_errors(short_dir, monkeypatch, line) -> None:
+    monkeypatch.chdir(short_dir)  # a relative socket would fit here, so only the absolute check can reject it
+    with pytest.raises(ConfigError):
+        load_config(write(short_dir, line + "\n"))
+
+
+def test_relative_socket_is_rejected_for_being_relative(short_dir, monkeypatch) -> None:
+    monkeypatch.chdir(short_dir)
+    with pytest.raises(ConfigError, match="absolute"):
+        load_config(write(short_dir, 'socket = "relative.sock"\n'))
+
+
+def test_empty_profile_and_empty_socket_and_state_dir_mean_default(tmp_path) -> None:
+    env = write(tmp_path, 'profile = ""\nsocket = ""\nstate_dir = ""\n')
+    env["HERDR_PLUGIN_STATE_DIR"] = str(tmp_path / "s")
+    cfg = load_config(env)
+    assert cfg.profile == ""
+    assert cfg.state_dir == tmp_path / "s"
+    assert cfg.socket.name.endswith(".sock")
+
+
+def test_tilde_paths_are_expanded_not_rejected(tmp_path) -> None:
+    cfg = load_config(write(tmp_path, 'anki_home = "~/Anki-test"\nstate_dir = "~/st"\n'))
+    assert cfg.anki_home == Path("~/Anki-test").expanduser()
+    assert cfg.state_dir == Path("~/st").expanduser()
+
+
+def test_relative_plugin_state_dir_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="absolute"):
+        load_config({"HERDR_PLUGIN_STATE_DIR": "relative/state"})
