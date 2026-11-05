@@ -777,3 +777,107 @@ def test_quit_while_not_running_without_marker_takes_no_lock(env, monkeypatch) -
     monkeypatch.setattr(actions, "socket_state", lambda p: "absent")
     monkeypatch.setattr(actions, "global_lock", lambda *a, **k: pytest.fail("lock taken"))
     assert quit_repetui(ctx, herdr, config) == "not_running"
+
+
+# --- fix round 3 ---
+
+
+def _orphan_with_marker(env, monkeypatch):
+    """An interrupted show: pane opened on server A, marker written, no record."""
+    config, herdr, ctx = env
+    real_move = herdr.move_beside
+    monkeypatch.setattr(herdr, "move_beside", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        toggle("bottom", ctx, herdr, config)
+    monkeypatch.setattr(herdr, "move_beside", real_move)
+    return next(iter(herdr.viewers))
+
+
+def _flaky_close(herdr, monkeypatch, failures):
+    """close_viewer times out `failures` times, then behaves normally."""
+    real, left = herdr.close_viewer, {"n": failures}
+
+    def close(pane_id, socket_path):
+        if left["n"] > 0:
+            left["n"] -= 1
+            herdr.calls.append(("close-timeout", pane_id, socket_path))
+            raise HerdrError("timeout", "plugin pane close")
+        return real(pane_id, socket_path)
+
+    monkeypatch.setattr(herdr, "close_viewer", close)
+
+
+def test_quit_not_running_retries_a_recorded_orphan(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    orphan = _orphan_with_marker(env, monkeypatch)
+    monkeypatch.setattr(actions, "socket_state", lambda p: "absent")
+    _flaky_close(herdr, monkeypatch, 1)
+    with pytest.raises(HerdrError):
+        quit_repetui(ctx, herdr, config)
+    viewer, _ = load_state(config.state_path)
+    assert (viewer.server_socket, viewer.pane_id) == orphan and load_pending(config.state_path) is not None
+    assert quit_repetui(ctx, herdr, config) == "not_running"
+    assert ("close", orphan[1], orphan[0]) in herdr.calls and not herdr.viewers
+    assert load_pending(config.state_path) is None and load_state(config.state_path)[0] is None
+
+
+def test_toggle_retries_a_recorded_orphan_and_ends_with_one_viewer(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    orphan = _orphan_with_marker(env, monkeypatch)
+    _flaky_close(herdr, monkeypatch, 1)
+    b = _server_b(herdr)
+    b_ctx = Context("w1", "w1:t1", "w1:p1", SRV_B, ROOT)
+    _flaky_close(b, monkeypatch, 1)
+    with pytest.raises(HerdrError):
+        toggle("bottom", b_ctx, b, config)
+    assert toggle("bottom", b_ctx, b, config) == "shown"
+    assert ("close", orphan[1], orphan[0]) in b.calls and orphan not in herdr.viewers
+    assert len(herdr.viewers) == 1 and next(iter(herdr.viewers))[0] == SRV_B
+    assert load_pending(config.state_path) is None
+
+
+@pytest.mark.parametrize("action", ["quit", "toggle"])
+def test_orphan_close_failing_twice_raises_both_times_and_keeps_everything(env, monkeypatch, action) -> None:
+    config, herdr, ctx = env
+    orphan = _orphan_with_marker(env, monkeypatch)
+    monkeypatch.setattr(actions, "socket_state", lambda p: "absent")
+    _flaky_close(herdr, monkeypatch, 2)
+    run = (lambda: quit_repetui(ctx, herdr, config)) if action == "quit" else (
+        lambda: toggle("side", ctx, herdr, config))
+    for _ in range(2):
+        with pytest.raises(HerdrError) as info:
+            run()
+        assert info.value.code == "timeout"
+        viewer, _ = load_state(config.state_path)
+        assert (viewer.server_socket, viewer.pane_id) == orphan
+        assert load_pending(config.state_path) is not None
+    assert [c[0] for c in herdr.calls].count("close-timeout") == 2 and orphan in herdr.viewers
+    assert "open" not in kinds(herdr)[1:]                 # only the interrupted show's open
+
+
+def test_quit_not_running_closes_a_recorded_launcher_without_marker(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    herdr.attach_after = 10**6                           # the launcher is still starting the owner
+    toggle("bottom", ctx, herdr, config)
+    recorded = load_state(config.state_path)[0]
+    monkeypatch.setattr(actions, "socket_state", lambda p: "absent")
+    herdr.calls.clear()
+    assert quit_repetui(ctx, herdr, config) == "not_running"
+    assert ("close", recorded.pane_id, recorded.server_socket) in herdr.calls and not herdr.viewers
+    assert load_state(config.state_path)[0] is None
+
+
+def test_quit_not_running_clears_a_record_whose_pane_is_gone(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    save_state(config.state_path, Viewer(herdr.socket_path, "w9:p9", "w9:t1", "", "bottom"), "bottom")
+    monkeypatch.setattr(actions, "socket_state", lambda p: "absent")
+    assert quit_repetui(ctx, herdr, config) == "not_running"
+    assert "close" not in kinds(herdr) and load_state(config.state_path)[0] is None
+
+
+def test_quit_rechecks_running_under_the_lock(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    toggle("bottom", ctx, herdr, config)
+    states = iter(["absent", "live"])                    # the owner came up while we waited
+    monkeypatch.setattr(actions, "socket_state", lambda p: next(states, "live"))
+    assert quit_repetui(ctx, herdr, config, sleep=lambda s: None) == "quit_sent"

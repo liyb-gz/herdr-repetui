@@ -146,9 +146,11 @@ def _close(herdr: Herdr, pane_id: str, server_socket: str) -> None:
 
 def _settle_pending(herdr: Herdr, config: Config, ctx: Context) -> None:
     """An earlier action wrote a pending marker and died before recording its pane. Scan the
-    marker's server (raw socket: it may be another herdr server) for a pane of ours and close it,
-    recording it first so a failed close is retried. The marker is cleared only once the scan
-    found nothing left, or the server is unreachable (its panes are gone with it)."""
+    marker's server (raw socket: it may be another herdr server) for panes of ours and close them,
+    recording each first so a failed close is retried. A pane that is already the record is NOT
+    skipped: an earlier settlement may have recorded it and then failed to close it. Any close
+    failure raises with record and marker kept. The marker is cleared only once the scan found
+    nothing of ours left, or the server is unreachable (its panes are gone with it)."""
     pending = load_pending(config.state_path)
     if pending is None:
         return
@@ -160,28 +162,45 @@ def _settle_pending(herdr: Herdr, config: Config, ctx: Context) -> None:
             raise                                    # unknown: keep the marker, abort the action
         panes = []
     for pane in panes:
-        if viewer is not None and (viewer.server_socket, viewer.pane_id) == (pending.server_socket,
-                                                                             pane["pane_id"]):
-            continue                                 # already recorded: handled as the viewer
         processes = _scan_processes(herdr, pane["pane_id"], pending.server_socket, config, ctx)
         if not is_viewer(processes, config.socket, ctx.plugin_root):
             continue
         orphan = Viewer(pending.server_socket, pane["pane_id"], pane.get("tab_id") or "", "", last)
-        save_state(config.state_path, viewer or orphan, last, pending=pending)
-        _close(herdr, orphan.pane_id, orphan.server_socket)
+        if viewer is None:
+            save_state(config.state_path, orphan, last, pending=pending)
+        _close(herdr, orphan.pane_id, orphan.server_socket)   # raises: record and marker kept
+        if viewer is not None and (viewer.server_socket, viewer.pane_id) == (orphan.server_socket,
+                                                                             orphan.pane_id):
+            viewer = None                            # the record was this orphan: confirmed closed
         save_state(config.state_path, viewer, last, pending=pending)
     save_state(config.state_path, viewer, last)
+
+
+def _recorded_alive(herdr: Herdr, config: Config, ctx: Context, viewer: Viewer) -> bool:
+    """Is the recorded pane still our viewer? The record proves ownership, so a tokenless launcher
+    counts; an empty or argv-less reading proves nothing either way: wait for it (then abort with
+    ownership_unresolved), never clear the record on it. False = confirmed gone or not ours."""
+    processes = _poll(herdr, viewer.pane_id, viewer.server_socket,
+                      lambda ps: not is_viewer(ps, config.socket, ctx.plugin_root, recorded=True)
+                      and (not ps or _unknown(ps)))
+    return is_viewer(processes, config.socket, ctx.plugin_root, recorded=True)
+
+
+def _retire_record(herdr: Herdr, config: Config, ctx: Context) -> None:
+    """repetui is not running, so a recorded viewer is a launcher that would start it again (or a
+    dead pane): close it. The record is cleared only once the pane is confirmed closed or gone."""
+    viewer, last = load_state(config.state_path)
+    if viewer is None:
+        return
+    if _recorded_alive(herdr, config, ctx, viewer):
+        _close(herdr, viewer.pane_id, viewer.server_socket)   # raises: record kept
+    save_state(config.state_path, None, last)
 
 
 def _current_viewer(herdr: Herdr, config: Config, ctx: Context) -> Viewer | None:
     viewer, last = load_state(config.state_path)
     if viewer is not None:
-        # The record proves ownership, so a tokenless launcher counts; but an empty or argv-less
-        # reading proves nothing either way: wait for it, never clear the record on it.
-        processes = _poll(herdr, viewer.pane_id, viewer.server_socket,
-                          lambda ps: not is_viewer(ps, config.socket, ctx.plugin_root, recorded=True)
-                          and (not ps or _unknown(ps)))
-        if is_viewer(processes, config.socket, ctx.plugin_root, recorded=True):
+        if _recorded_alive(herdr, config, ctx, viewer):
             return viewer
         save_state(config.state_path, None, last)      # confirmed: gone, or no longer our viewer
     for pane in herdr.panes():
@@ -287,14 +306,17 @@ def toggle(placement: str, ctx: Context, herdr: Herdr, config: Config, *, plugin
 def quit_repetui(ctx: Context, herdr: Herdr, config: Config, *, plugin_id: str = "repetui.bar",
                  wait: float = 5.0, sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic) -> str:
-    if socket_state(config.socket) != "live":
-        if load_pending(config.state_path) is not None:  # an interrupted show left an orphan pane
-            with global_lock(config.lock_path):
-                _settle_pending(herdr, config, ctx)
-        _notice(herdr, "Nothing to quit.", title="repetui is not running")
+    if (socket_state(config.socket) != "live" and load_pending(config.state_path) is None
+            and load_state(config.state_path)[0] is None):
+        _notice(herdr, "Nothing to quit.", title="repetui is not running")   # nothing owned: no lock
         return "not_running"
     with global_lock(config.lock_path):
         _settle_pending(herdr, config, ctx)
+        if socket_state(config.socket) != "live":       # re-checked under the lock
+            # "not running" only once nothing of ours is left that could start it again
+            _retire_record(herdr, config, ctx)
+            _notice(herdr, "Nothing to quit.", title="repetui is not running")
+            return "not_running"
         viewer = _current_viewer(herdr, config, ctx)
         _, last = load_state(config.state_path)
         if _in_this_tab(viewer, herdr, ctx):
