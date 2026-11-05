@@ -200,7 +200,10 @@ class Herdr:
             raise _bad(f"plugin.pane.close: closed {result.get('pane_id')!r}, expected {pane_id!r}")
 
     def focus(self, pane_id: str) -> None:
-        self.request("pane.focus", {"pane_id": pane_id})
+        # {"id", "result": {"type": "pane_info", "pane": {"pane_id": <the focused pane>, ...}}} (spike Step 5)
+        result = _result_of(self.request("pane.focus", {"pane_id": pane_id}), "pane_info", "pane.focus")
+        if _need_dict(result.get("pane"), "pane.focus pane").get("pane_id") != pane_id:
+            raise _bad(f"pane.focus: reply is not for {pane_id!r}")
 
     def foreground_processes(self, pane_id: str, socket_path: str | None = None) -> list[dict] | None:
         try:

@@ -608,3 +608,25 @@ def test_contradictory_envelope_never_reads_as_a_gone_pane(short_dir) -> None:
         assert info.value.code == "bad_response"
     finally:
         finish(path, t)
+
+
+@pytest.mark.parametrize(("reply", "ok"), [
+    # verbatim shape from the spike (Step 5): pane.focus returns the focused pane's pane_info
+    (b'{"id":"$ID","result":{"type":"pane_info","pane":{"pane_id":"w1:p3","focused":true}}}\n', True),
+    (b'{"id":"$ID","result":{"type":"ok"}}\n', False),
+    (b'{"id":"$ID","result":{"type":"pane_info"}}\n', False),
+    (b'{"id":"$ID","result":{"type":"pane_info","pane":{"pane_id":"w1:p9"}}}\n', False),
+])
+def test_focus_requires_the_pane_info_of_the_focused_pane(short_dir, reply, ok) -> None:
+    path = str(short_dir / "fo.sock")
+    t = serve_once(path, reply)
+    try:
+        if ok:
+            assert Herdr("herdr", path).focus("w1:p3") is None
+        else:
+            with pytest.raises(HerdrError) as info:
+                Herdr("herdr", path).focus("w1:p3")
+            assert info.value.code == "bad_response"
+    finally:
+        t.join()
+        Path(path).unlink(missing_ok=True)
