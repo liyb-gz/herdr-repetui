@@ -21,25 +21,51 @@ class HerdrError(RuntimeError):
         self.code = code
 
 
+def _bad(message: str) -> HerdrError:
+    return HerdrError("bad_response", message)
+
+
+def _need_dict(value: object, what: str) -> dict:
+    if not isinstance(value, dict):
+        raise _bad(f"{what}: expected an object")
+    return value
+
+
+def _error_from_value(error: object, what: str) -> HerdrError:
+    """Build the HerdrError for a parsed `error` member; a malformed one is bad_response."""
+    if not isinstance(error, dict):
+        return _bad(f"{what}: error is not an object")
+    code = error.get("code")
+    if not isinstance(code, str) or not code:
+        return _bad(f"{what}: error has no code")
+    return HerdrError(code, str(error.get("message", "")))
+
+
 def _error_from(text: str) -> HerdrError:
+    """Interpret the output of a failed CLI call (non-zero exit)."""
     try:
-        error = json.loads(text)["error"]
-        return HerdrError(str(error.get("code", "error")), str(error.get("message", "")))
-    except (ValueError, KeyError, TypeError):
-        return HerdrError("cli_failed", text.strip()[:200])
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return HerdrError("cli_failed", str(text).strip()[:200])
+    if not isinstance(parsed, dict) or "error" not in parsed:
+        return HerdrError("cli_failed", str(text).strip()[:200])
+    if "result" in parsed:
+        return _bad("cli: both result and error")
+    return _error_from_value(parsed["error"], "cli")
 
 
-def _first_pane_id(value: object) -> str | None:
-    """Find result.*.pane.pane_id (e.g. .result.plugin_pane.pane.pane_id from plugin pane open)."""
-    if isinstance(value, dict):
-        pane = value.get("pane")
-        if isinstance(pane, dict) and isinstance(pane.get("pane_id"), str):
-            return pane["pane_id"]
-        for child in value.values():
-            found = _first_pane_id(child)
-            if found:
-                return found
-    return None
+def _check_processes(processes: object, pane_id: str) -> list[dict]:
+    if processes is None:
+        raise _bad(f"pane.process_info for {pane_id}: foreground_processes is null")
+    if not isinstance(processes, list):
+        raise _bad(f"pane.process_info for {pane_id}: foreground_processes is not a list")
+    for process in processes:
+        if not isinstance(process, dict):
+            raise _bad(f"pane.process_info for {pane_id}: foreground process is not an object")
+        argv = process.get("argv")
+        if argv is not None and not (isinstance(argv, list) and all(isinstance(a, str) for a in argv)):
+            raise _bad(f"pane.process_info for {pane_id}: argv is not a list of strings")
+    return processes
 
 
 class Herdr:
@@ -59,10 +85,19 @@ class Herdr:
             raise HerdrError("no_herdr", str(exc)) from exc
         if proc.returncode != 0:
             raise _error_from(proc.stderr or proc.stdout)
+        if not proc.stdout.strip():
+            return {}
         try:
-            return json.loads(proc.stdout) if proc.stdout.strip() else {}
+            parsed = json.loads(proc.stdout)
         except ValueError as exc:
-            raise HerdrError("bad_response", proc.stdout[:200]) from exc
+            raise _bad(proc.stdout[:200]) from exc
+        if not isinstance(parsed, dict):
+            raise _bad(f"herdr {' '.join(args[:2])}: output is not an object")
+        if "error" in parsed:
+            if "result" in parsed:
+                raise _bad(f"herdr {' '.join(args[:2])}: both result and error")
+            raise _error_from_value(parsed["error"], f"herdr {' '.join(args[:2])}")
+        return parsed
 
     def request(self, method: str, params: dict, *, socket_path: str | None = None) -> dict:
         request_id = f"repetui-{uuid.uuid4().hex[:8]}"
@@ -89,33 +124,46 @@ class Herdr:
         try:
             response = json.loads(data.split(b"\n", 1)[0])
         except ValueError as exc:
-            raise HerdrError("bad_response", method) from exc
+            raise _bad(method) from exc
         if not isinstance(response, dict) or response.get("id") != request_id:
-            raise HerdrError("bad_response", f"{method}: id mismatch")
+            raise _bad(f"{method}: id mismatch")
+        # exactly one of result/error, so a contradictory reply is never read as a disappearance code
+        if "error" in response and "result" in response:
+            raise _bad(f"{method}: both result and error")
         if "error" in response:
-            error = response["error"] or {}
-            raise HerdrError(str(error.get("code", "error")), str(error.get("message", "")))
-        if "result" not in response:
-            raise HerdrError("bad_response", f"{method}: no result")
+            raise _error_from_value(response["error"], method)
+        if not isinstance(response.get("result"), dict):
+            raise _bad(f"{method}: no result object")
         return response
 
     def open_viewer_in_new_tab(self, plugin_id: str, workspace_id: str) -> str:
-        result = self.cli("plugin", "pane", "open", "--plugin", plugin_id, "--entrypoint", "review",
-                          "--placement", "tab", "--workspace", workspace_id, "--no-focus")
-        pane_id = _first_pane_id(result)
-        if pane_id is None:
-            raise HerdrError("no_pane_id", json.dumps(result)[:200])
+        envelope = self.cli("plugin", "pane", "open", "--plugin", plugin_id, "--entrypoint", "review",
+                            "--placement", "tab", "--workspace", workspace_id, "--no-focus")
+        # schema: {"result": {"type": "plugin_pane_opened", "plugin_pane": {"pane": {"pane_id": ...}}}}
+        result = _need_dict(envelope.get("result"), "plugin pane open result")
+        if result.get("type") != "plugin_pane_opened":
+            raise _bad(f"plugin pane open: unexpected result type {result.get('type')!r}")
+        plugin_pane = _need_dict(result.get("plugin_pane"), "plugin pane open plugin_pane")
+        pane = _need_dict(plugin_pane.get("pane"), "plugin pane open pane")
+        pane_id = pane.get("pane_id")
+        if not isinstance(pane_id, str) or not pane_id:
+            raise _bad("plugin pane open: no pane id")
         return pane_id
 
     def move_beside(self, pane_id: str, tab_id: str, target_pane_id: str, direction: str, ratio: float) -> str:
-        result = self.cli("pane", "move", pane_id, "--tab", tab_id, "--target-pane", target_pane_id,
-                          "--split", direction, "--ratio", f"{ratio:.4f}", "--focus")
-        move = (result.get("result") or {}).get("move_result") or {}
-        if not isinstance(move, dict) or not move.get("changed", False):
-            raise HerdrError("not_moved", str(move.get("reason", "unknown")) if isinstance(move, dict) else "?")
-        new_id = (move.get("pane") or {}).get("pane_id")
+        envelope = self.cli("pane", "move", pane_id, "--tab", tab_id, "--target-pane", target_pane_id,
+                            "--split", direction, "--ratio", f"{ratio:.4f}", "--focus")
+        # schema: {"result": {"move_result": {"changed": bool, "pane": {"pane_id": ...}, "reason"?}}}
+        result = _need_dict(envelope.get("result"), "pane move result")
+        move = _need_dict(result.get("move_result"), "pane move move_result")
+        changed = move.get("changed")
+        if not isinstance(changed, bool):
+            raise _bad("pane move: changed is not a boolean")
+        if not changed:
+            raise HerdrError("not_moved", str(move.get("reason", "unknown")))
+        new_id = _need_dict(move.get("pane"), "pane move pane").get("pane_id")
         if not isinstance(new_id, str) or not new_id:
-            raise HerdrError("bad_response", "pane move: no pane id")
+            raise _bad("pane move: no pane id")
         return new_id
 
     def close_viewer(self, pane_id: str, socket_path: str) -> None:
@@ -123,11 +171,11 @@ class Herdr:
             envelope = self.cli("plugin", "pane", "close", pane_id)
         else:
             envelope = self.request("plugin.pane.close", {"pane_id": pane_id}, socket_path=socket_path)
-        result = envelope.get("result") if isinstance(envelope, dict) else None
+        result = envelope.get("result")
         # schema: {"type": "plugin_pane_closed", "pane_id": ...}, both required
         if (not isinstance(result, dict) or result.get("type") != "plugin_pane_closed"
                 or result.get("pane_id") != pane_id):
-            raise HerdrError("bad_response", f"plugin.pane.close: {str(envelope)[:200]}")
+            raise _bad(f"plugin.pane.close: {str(envelope)[:200]}")
 
     def focus(self, pane_id: str) -> None:
         self.request("pane.focus", {"pane_id": pane_id})
@@ -139,28 +187,50 @@ class Herdr:
             if exc.code in GONE_CODES:
                 return None
             raise
-        result = response["result"]
         # schema: {"type": "pane_process_info", "process_info": {"pane_id", "foreground_processes", ...}}
-        if not isinstance(result, dict) or result.get("type") != "pane_process_info":
-            raise HerdrError("bad_response", f"pane.process_info for {pane_id}")
+        result = response["result"]
+        if result.get("type") != "pane_process_info":
+            raise _bad(f"pane.process_info for {pane_id}: unexpected result type")
         info = result.get("process_info")
         if not isinstance(info, dict) or info.get("pane_id") != pane_id:
-            raise HerdrError("bad_response", f"pane.process_info for {pane_id}")
-        processes = info.get("foreground_processes")
-        return [p for p in processes if isinstance(p, dict)] if isinstance(processes, list) else []
+            raise _bad(f"pane.process_info for {pane_id}: wrong or missing process_info")
+        if "foreground_processes" not in info:  # the schema allows omitting it
+            return []
+        return _check_processes(info["foreground_processes"], pane_id)
 
     def panes(self) -> list[dict]:
         # `pane list` without --workspace covers all workspaces (verified on herdr 0.9.5)
-        listed = self.cli("pane", "list").get("result", {}).get("panes", [])
-        return [{"pane_id": p["pane_id"], "tab_id": p.get("tab_id"), "workspace_id": p.get("workspace_id")}
-                for p in listed]
+        envelope = self.cli("pane", "list")
+        listed = _need_dict(envelope.get("result"), "pane list result").get("panes")
+        if not isinstance(listed, list):
+            raise _bad("pane list: panes is not a list")
+        panes = []
+        for pane in listed:
+            if not isinstance(pane, dict) or not isinstance(pane.get("pane_id"), str):
+                raise _bad("pane list: entry without a string pane_id")
+            for key in ("tab_id", "workspace_id"):
+                if pane.get(key) is not None and not isinstance(pane[key], str):
+                    raise _bad(f"pane list: {key} is not a string")
+            panes.append({"pane_id": pane["pane_id"], "tab_id": pane.get("tab_id"),
+                          "workspace_id": pane.get("workspace_id")})
+        return panes
 
     def layout(self, pane_id: str) -> dict:
-        return self.cli("pane", "layout", "--pane", pane_id)["result"]["layout"]
+        envelope = self.cli("pane", "layout", "--pane", pane_id)
+        layout = _need_dict(_need_dict(envelope.get("result"), "pane layout result").get("layout"),
+                            "pane layout layout")
+        if not isinstance(layout.get("area"), dict) or not isinstance(layout.get("panes"), list):
+            raise _bad("pane layout: layout needs an area object and a panes list")
+        return layout
 
     def notify(self, title: str, body: str) -> bool:
-        envelope = self.cli("notification", "show", title, "--body", body)
-        result = envelope.get("result") if isinstance(envelope, dict) else None
+        try:
+            envelope = self.cli("notification", "show", title, "--body", body)
+        except HerdrError as exc:
+            if exc.code == "bad_response":  # unconfirmed, so not "shown"; transport errors still raise
+                return False
+            raise
+        result = envelope.get("result")
         return isinstance(result, dict) and result.get("shown") is True
 
     def send_keys(self, pane_id: str, *keys: str) -> None:
