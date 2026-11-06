@@ -685,3 +685,15 @@ def test_panes_on_unreachable_server(short_dir) -> None:
     with pytest.raises(HerdrError) as info:
         Herdr("herdr", "/tmp/none.sock").panes_on(str(short_dir / "gone.sock"))
     assert info.value.code == "server_unreachable"
+
+
+def test_cli_uses_the_configured_timeout() -> None:
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(argv, 0, '{"id": "x", "result": {"type": "pane_list", "panes": []}}', "")
+
+    assert Herdr("herdr", "/tmp/none.sock", run=run).panes() == []
+    assert Herdr("herdr", "/tmp/none.sock", run=run, cli_timeout=2.5).panes() == []
+    assert seen == [15.0, 2.5]                       # default unchanged; configured value used

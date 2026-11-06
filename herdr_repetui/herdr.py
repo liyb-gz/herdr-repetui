@@ -95,11 +95,14 @@ def _pane_entries(envelope: object, what: str) -> list[dict]:
 
 class Herdr:
     def __init__(self, bin_path: str, socket_path: str, *,
-                 run: Callable[..., object] = subprocess.run, timeout: float = 5.0) -> None:
+                 run: Callable[..., object] = subprocess.run, timeout: float = 5.0,
+                 cli_timeout: float = 15.0) -> None:
+        """`timeout` bounds a raw socket request, `cli_timeout` one `herdr` CLI call."""
         self.bin_path = bin_path
         self.socket_path = socket_path
         self._run = run
         self._timeout = timeout
+        self._cli_timeout = cli_timeout
 
     def cli(self, *args: str, empty_ok: bool = False) -> dict:
         """Run `herdr <args>` and return its envelope `{"id", "result": {...}}`.
@@ -113,7 +116,8 @@ class Herdr:
         """
         what = f"herdr {' '.join(args[:2])}"
         try:
-            proc = self._run([self.bin_path, *args], capture_output=True, text=True, timeout=15)
+            proc = self._run([self.bin_path, *args], capture_output=True, text=True,
+                             timeout=self._cli_timeout)
         except subprocess.TimeoutExpired as exc:
             raise HerdrError("timeout", what) from exc
         except FileNotFoundError as exc:
