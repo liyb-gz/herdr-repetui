@@ -971,3 +971,44 @@ def test_recorded_viewer_alive_but_unlisted_aborts_without_change(env, monkeypat
         toggle("bottom", ctx, herdr, config)
     assert info.value.code == "ownership_unresolved"
     assert load_state(config.state_path)[0] == recorded and kinds(herdr) == []
+
+
+# --- final review: no silent action failures (O-M2) ---
+
+def test_toggle_script_reports_unexpected_exceptions(short_dir, monkeypatch) -> None:
+    script = _toggle_script()
+    reported = []
+    monkeypatch.setattr(script, "_report", lambda herdr, message: reported.append(message))
+    monkeypatch.setattr(script, "load_config", lambda env: object())
+    monkeypatch.setattr(script, "toggle", lambda *a, **k: (_ for _ in ()).throw(KeyError("odd shape")))
+    assert script.main(["toggle.py", "toggle-side"]) == 1
+    assert reported == ["toggle-side failed: KeyError: 'odd shape'"]
+
+
+OLD_PYTHON = "/usr/bin/python3"
+
+
+def _old_python_ok() -> bool:
+    import os
+    import subprocess
+    if not os.access(OLD_PYTHON, os.X_OK):
+        return False
+    out = subprocess.run([OLD_PYTHON, "-c", "import sys; print(sys.version_info >= (3, 11))"],
+                         capture_output=True, text=True)
+    return out.stdout.strip() == "False"
+
+
+@pytest.mark.skipif(not _old_python_ok(), reason="needs a Python older than 3.11 at /usr/bin/python3")
+@pytest.mark.parametrize(("script", "args"), [("toggle.py", ["toggle-bottom"]), ("launch.py", [])])
+def test_scripts_explain_an_old_python_in_one_line(short_dir, script, args) -> None:
+    import os
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+    env["HERDR_REPETUI_CONFIG"] = str(short_dir / "missing.toml")   # never the real config
+    out = subprocess.run([OLD_PYTHON, "-I", str(root / script), *args], capture_output=True,
+                         text=True, env=env, cwd=short_dir, timeout=30)
+    assert out.returncode == 1
+    lines = out.stderr.strip().splitlines()
+    assert len(lines) == 1 and "Python 3.11" in lines[0] and "Traceback" not in out.stderr

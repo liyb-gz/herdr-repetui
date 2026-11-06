@@ -2,6 +2,11 @@ import os
 import sys
 from pathlib import Path
 
+if sys.version_info < (3, 11):  # tomllib; macOS's /usr/bin/python3 is 3.9
+    sys.stderr.write("repetui.bar needs Python 3.11 or newer as python3 on herdr's PATH; found "
+                     "%d.%d at %s\n" % (sys.version_info[0], sys.version_info[1], sys.executable))
+    sys.exit(1)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from herdr_repetui.actions import (  # noqa: E402
     _mac_notify, context_from_env, notify_user, quit_repetui, startup, toggle,
@@ -32,6 +37,9 @@ def main(argv: list[str]) -> int:
             toggle(command.removeprefix("toggle-"), context_from_env(os.environ), herdr, config)
     except (HerdrError, LockTimeout, SocketProbeError, ConfigError, OSError) as exc:
         _report(herdr, f"{command} failed: {exc}")
+        return 1
+    except Exception as exc:  # anything unforeseen still reaches the user, never a silent traceback
+        _report(herdr, f"{command} failed: {type(exc).__name__}: {exc}")
         return 1
     return 0
 
