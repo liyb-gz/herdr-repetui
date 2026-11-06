@@ -916,3 +916,58 @@ def test_recorded_pane_keeps_strict_handling_of_any_argv_less_entry(env, monkeyp
         toggle("bottom", ctx, herdr, config)
     assert info.value.code == "ownership_unresolved"
     assert load_state(config.state_path)[0] == recorded and kinds(herdr) == []
+
+
+# --- final review: a viewer moved by hand keeps its pane id (C-I2) ---
+
+def _move_by_hand(herdr, pane_id, tab):
+    herdr.viewers[(herdr.socket_path, pane_id)]["tab"] = tab   # herdr preserves the pane id
+
+
+def test_viewer_moved_away_by_hand_is_shown_here_not_hidden(env) -> None:
+    config, herdr, ctx = env
+    toggle("bottom", ctx, herdr, config)
+    viewer, _ = load_state(config.state_path)
+    _move_by_hand(herdr, viewer.pane_id, "w1:t2")
+    herdr.calls.clear()
+    assert toggle("bottom", ctx, herdr, config) == "shown"
+    assert kinds(herdr) == ["close", "open", "move"] and herdr.calls[0][1] == viewer.pane_id
+    assert len(herdr.viewers) == 1 and next(iter(herdr.viewers.values()))["tab"] == "w1:t1"
+    assert load_state(config.state_path)[0].tab_id == "w1:t1"
+
+
+def test_viewer_moved_here_by_hand_is_hidden_without_focusing_another_tab(env) -> None:
+    config, herdr, ctx = env
+    toggle("bottom", Context("w2", "w2:t1", "w2:p1", herdr.socket_path, ROOT), herdr, config)
+    viewer, _ = load_state(config.state_path)
+    _move_by_hand(herdr, viewer.pane_id, "w1:t1")
+    herdr.calls.clear()
+    assert toggle("bottom", ctx, herdr, config) == "hidden"
+    assert kinds(herdr) == ["close"]               # the old origin sits in another tab: no focus
+    assert herdr.viewers == {} and load_state(config.state_path)[0] is None
+
+
+def test_quit_does_not_focus_a_viewer_moved_to_another_tab(env) -> None:
+    config, herdr, ctx = env
+    toggle("bottom", ctx, herdr, config)
+    viewer, _ = load_state(config.state_path)
+    _move_by_hand(herdr, viewer.pane_id, "w1:t2")
+    herdr.calls.clear()
+    assert quit_repetui(ctx, herdr, config, sleep=lambda s: None) == "quit_sent"
+    assert ("focus", viewer.pane_id) not in herdr.calls
+    assert kinds(herdr)[:3] == ["close", "open", "move"]
+    new_pane = [c for c in herdr.calls if c[0] == "move"][0][1] + "m"
+    assert herdr.calls[-1] == ("keys", new_pane, ("q",))
+
+
+def test_recorded_viewer_alive_but_unlisted_aborts_without_change(env, monkeypatch) -> None:
+    config, herdr, ctx = env
+    toggle("bottom", ctx, herdr, config)
+    recorded = load_state(config.state_path)[0]
+    monkeypatch.setattr(herdr, "panes", lambda: [p for p in herdr._list(herdr.socket_path)
+                                                 if p["pane_id"] != recorded.pane_id])
+    herdr.calls.clear()
+    with pytest.raises(HerdrError) as info:
+        toggle("bottom", ctx, herdr, config)
+    assert info.value.code == "ownership_unresolved"
+    assert load_state(config.state_path)[0] == recorded and kinds(herdr) == []

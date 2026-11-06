@@ -8,7 +8,7 @@ import subprocess
 import time
 import tomllib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import Config, herdr_config_path
@@ -214,11 +214,29 @@ def _retire_record(herdr: Herdr, config: Config, ctx: Context) -> None:
     save_state(config.state_path, None, last)
 
 
+def _relocate(herdr: Herdr, config: Config, viewer: Viewer, last: str) -> Viewer:
+    """The recorded viewer's live tab, from validated pane metadata. herdr keeps the pane id when a
+    pane is moved by hand between tabs or workspaces, so the recorded tab may be stale. A moved
+    viewer's origin belongs to its old tab, so it is dropped. A live viewer that herdr does not
+    list cannot be placed: abort without changing anything."""
+    panes = herdr.panes() if viewer.server_socket == herdr.socket_path else herdr.panes_on(
+        viewer.server_socket)
+    pane = next((p for p in panes if p["pane_id"] == viewer.pane_id), None)
+    if pane is None:
+        raise HerdrError("ownership_unresolved", f"viewer {viewer.pane_id} is running but not listed")
+    tab_id = pane.get("tab_id")
+    if not tab_id or tab_id == viewer.tab_id:
+        return viewer
+    moved = replace(viewer, tab_id=tab_id, origin_pane_id="")
+    save_state(config.state_path, moved, last)
+    return moved
+
+
 def _current_viewer(herdr: Herdr, config: Config, ctx: Context) -> Viewer | None:
     viewer, last = load_state(config.state_path)
     if viewer is not None:
         if _recorded_alive(herdr, config, ctx, viewer):
-            return viewer
+            return _relocate(herdr, config, viewer, last)
         save_state(config.state_path, None, last)      # confirmed: gone, or no longer our viewer
     for pane in herdr.panes():
         processes = _scan_processes(herdr, pane["pane_id"], None, config, ctx)
