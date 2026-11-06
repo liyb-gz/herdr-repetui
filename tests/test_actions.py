@@ -881,3 +881,38 @@ def test_quit_rechecks_running_under_the_lock(env, monkeypatch) -> None:
     states = iter(["absent", "live"])                    # the owner came up while we waited
     monkeypatch.setattr(actions, "socket_state", lambda p: next(states, "live"))
     assert quit_repetui(ctx, herdr, config, sleep=lambda s: None) == "quit_sent"
+
+
+# --- final review: argv-less foreign processes (O-I1) ---
+
+def test_argv_less_foreign_process_blocks_neither_toggle_nor_quit(env, monkeypatch, no_wait) -> None:
+    config, herdr, ctx = env
+    reads = _procs_for(herdr, monkeypatch, "w2:p1", [{"pid": 1, "name": "sudo"}])  # unrelated pane
+    assert toggle("bottom", ctx, herdr, config) == "shown"
+    assert reads["n"] == 1                                  # read once, skipped, never polled
+    assert toggle("bottom", ctx, herdr, config) == "hidden"  # hide clears the record
+    herdr.calls.clear()
+    assert quit_repetui(ctx, herdr, config, sleep=lambda s: None) == "quit_sent"
+    assert kinds(herdr)[-1] == "keys" and "w2:p1" not in [c[1] for c in herdr.calls if c[0] == "close"]
+
+
+@pytest.mark.parametrize("name", ["dtach", "python3", "python3.11", "python"])
+def test_argv_less_process_that_could_be_ours_stays_unresolved(env, monkeypatch, no_wait, name) -> None:
+    config, herdr, ctx = env
+    reads = _procs_for(herdr, monkeypatch, "w2:p1", [{"pid": 1, "name": name}])
+    with pytest.raises(HerdrError) as info:
+        toggle("bottom", ctx, herdr, config)
+    assert info.value.code == "ownership_unresolved" and reads["n"] > 1
+    assert "open" not in kinds(herdr)
+
+
+def test_recorded_pane_keeps_strict_handling_of_any_argv_less_entry(env, monkeypatch, no_wait) -> None:
+    config, herdr, ctx = env
+    toggle("bottom", ctx, herdr, config)
+    recorded = load_state(config.state_path)[0]
+    _procs_for(herdr, monkeypatch, recorded.pane_id, [{"pid": 1, "name": "sudo"}])
+    herdr.calls.clear()
+    with pytest.raises(HerdrError) as info:
+        toggle("bottom", ctx, herdr, config)
+    assert info.value.code == "ownership_unresolved"
+    assert load_state(config.state_path)[0] == recorded and kinds(herdr) == []

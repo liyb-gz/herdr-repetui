@@ -106,6 +106,21 @@ def _unknown(processes: list[dict] | None) -> bool:
     return bool(processes) and any(not p.get("argv") for p in processes)
 
 
+def _could_be_ours(process: dict) -> bool:
+    """Our viewer's processes are dtach or a python launcher, same-user, so herdr can always read
+    their argv. An argv-less process with another name (e.g. another user's `sudo`) is not ours."""
+    name = process.get("name")
+    if not isinstance(name, str) or not name:
+        return True                        # no name either: we cannot rule it out
+    name = Path(name).name
+    return name == "dtach" or name.startswith("python")
+
+
+def _unknown_scan(processes: list[dict] | None) -> bool:
+    """Adoption scan: only an argv-less entry that could be ours is unresolved."""
+    return bool(processes) and any(not p.get("argv") and _could_be_ours(p) for p in processes)
+
+
 def _poll(herdr: Herdr, pane_id: str, socket_path: str | None,
           unresolved: Callable[[list[dict]], bool]) -> list[dict] | None:
     """Read a pane's processes until they are resolved or the pane is confirmed gone (None).
@@ -128,11 +143,13 @@ def _poll(herdr: Herdr, pane_id: str, socket_path: str | None,
 def _scan_processes(herdr: Herdr, pane_id: str, socket_path: str | None, config: Config,
                     ctx: Context) -> list[dict] | None:
     """Processes of a pane met in an adoption scan. A tokenless launcher of ours (an action died
-    between `plugin pane open` and its re-exec) or an argv-less entry is unresolved: adopting
-    nothing could leave a second viewer, adopting blindly could close someone else's. An empty
-    list is resolved: no foreground process, so not a viewer."""
+    between `plugin pane open` and its re-exec) or an argv-less entry that could be ours (dtach or
+    python) is unresolved: adopting nothing could leave a second viewer, adopting blindly could
+    close someone else's. Any other argv-less entry is skipped, so a pane running a process herdr
+    cannot read (another user's `sudo`) never blocks the action. An empty list is resolved: no
+    foreground process, so not a viewer."""
     return _poll(herdr, pane_id, socket_path, lambda ps: not is_viewer(ps, config.socket, ctx.plugin_root)
-                 and (_tokenless_launcher(ps, ctx.plugin_root) or _unknown(ps)))
+                 and (_tokenless_launcher(ps, ctx.plugin_root) or _unknown_scan(ps)))
 
 
 def _close(herdr: Herdr, pane_id: str, server_socket: str) -> None:
