@@ -112,7 +112,7 @@ def _could_be_ours(process: dict) -> bool:
     name = process.get("name")
     if not isinstance(name, str) or not name:
         return True                        # no name either: we cannot rule it out
-    name = Path(name).name
+    name = Path(name).name.lower()            # macOS reports the framework interpreter as `Python`
     return name == "dtach" or name.startswith("python")
 
 

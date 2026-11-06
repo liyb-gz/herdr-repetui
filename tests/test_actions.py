@@ -896,7 +896,8 @@ def test_argv_less_foreign_process_blocks_neither_toggle_nor_quit(env, monkeypat
     assert kinds(herdr)[-1] == "keys" and "w2:p1" not in [c[1] for c in herdr.calls if c[0] == "close"]
 
 
-@pytest.mark.parametrize("name", ["dtach", "python3", "python3.11", "python"])
+@pytest.mark.parametrize("name", ["dtach", "python3", "python3.11", "python", "Python", "DTACH",
+                                  "Python3", "/usr/local/bin/Python"])
 def test_argv_less_process_that_could_be_ours_stays_unresolved(env, monkeypatch, no_wait, name) -> None:
     config, herdr, ctx = env
     reads = _procs_for(herdr, monkeypatch, "w2:p1", [{"pid": 1, "name": name}])
@@ -1012,3 +1013,14 @@ def test_scripts_explain_an_old_python_in_one_line(short_dir, script, args) -> N
     assert out.returncode == 1
     lines = out.stderr.strip().splitlines()
     assert len(lines) == 1 and "Python 3.11" in lines[0] and "Traceback" not in out.stderr
+
+
+def test_argv_less_python_launcher_is_never_skipped_into_a_second_viewer(env, monkeypatch, no_wait) -> None:
+    """This Mac's interpreter reports its name as `Python`: an argv-less launcher must not be skipped."""
+    config, herdr, ctx = env
+    herdr.viewers[(herdr.socket_path, "w2:p9")] = {"tab": "w2:t1", "state": "dtach", "polls": 0}
+    _procs_for(herdr, monkeypatch, "w2:p9", [{"pid": 7, "name": "Python"}])
+    with pytest.raises(HerdrError) as info:
+        toggle("bottom", ctx, herdr, config)
+    assert info.value.code == "ownership_unresolved"
+    assert "open" not in kinds(herdr) and len(herdr.viewers) == 1
