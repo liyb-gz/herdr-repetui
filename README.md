@@ -155,6 +155,12 @@ keep their ids and processes. If a pane can't be moved back, the error names it,
 and it is still running in the `repetui-layout` tab. If the layout can't be read
 exactly, or the tab is zoomed, the bar falls back to splitting the focused pane.
 
+repetui runs with `REPETUI_NATIVE_IMAGES=kitty` when herdr forwards pictures
+(`[terminal] kitty_graphics`, on by default), so card pictures and the larger
+front text (`z` in repetui) appear as sharp images. With `kitty_graphics = false`
+it runs with `off`. The setting is read when repetui starts, so quit repetui
+after changing it.
+
 If herdr restarts while the bar is showing, herdr restores a plain shell pane in
 the bar's place; repetui keeps running and is not started again. Close that pane
 and toggle as usual.

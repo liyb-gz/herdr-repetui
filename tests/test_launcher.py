@@ -139,8 +139,20 @@ def test_owner_env(cfg, tmp_path) -> None:
                                     "XDG_CONFIG_HOME": "/tmp/x", "PATH": "/bin"}, herdr_cfg)
     assert "HERDR_PANE_ID" not in env and "HERDR_TAB_ID" not in env
     assert env["PATH"] == "/bin" and env["XDG_CONFIG_HOME"] == "/tmp/x"   # inherited, isolates prefs
-    assert env["REPETUI_NATIVE_IMAGES"] == "off"
+    assert env["REPETUI_NATIVE_IMAGES"] == "kitty"            # herdr forwards pictures by default
     assert env["REPETUI_HERDR_KEYS"] == "bottom=prefix+y;side=prefix+shift+a"
+
+
+@pytest.mark.parametrize("toml,expected", [
+    ("", "kitty"),
+    ("[terminal]\nkitty_graphics = true\n", "kitty"),
+    ("[terminal]\nkitty_graphics = false\n", "off"),
+    ("not toml [", "kitty"),
+])
+def test_pictures_follow_herdr_kitty_graphics(cfg, tmp_path, toml, expected) -> None:
+    herdr_cfg = tmp_path / "herdr.toml"
+    herdr_cfg.write_text(toml)
+    assert owner_env(cfg, {}, herdr_cfg)["REPETUI_NATIVE_IMAGES"] == expected
 
 
 def test_herdr_keys_default_when_missing(tmp_path) -> None:

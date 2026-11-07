@@ -39,11 +39,23 @@ def herdr_keys_value(herdr_config: Path) -> str:
     return ";".join(f"{name}={key}" for name, key in keys.items())
 
 
+def herdr_kitty_graphics(herdr_config: Path) -> bool:
+    """herdr's [terminal] kitty_graphics (default true): whether pane pictures reach the terminal.
+    repetui draws card pictures and its larger front text that way."""
+    try:
+        with herdr_config.open("rb") as handle:
+            terminal = tomllib.load(handle).get("terminal", {})
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return True
+    value = terminal.get("kitty_graphics", True) if isinstance(terminal, dict) else True
+    return value is not False
+
+
 def owner_env(config: Config, base: Mapping[str, str], herdr_config: Path | None = None) -> dict[str, str]:
     herdr_config = herdr_config or herdr_config_path(base)
     env = {key: value for key, value in base.items() if key not in _PANE_VARS}
     env["REPETUI_ANKI_HOME"] = str(config.anki_home)
-    env["REPETUI_NATIVE_IMAGES"] = "off"
+    env["REPETUI_NATIVE_IMAGES"] = "kitty" if herdr_kitty_graphics(herdr_config) else "off"
     env["REPETUI_HERDR_KEYS"] = herdr_keys_value(herdr_config)
     return env
 
