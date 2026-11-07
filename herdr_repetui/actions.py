@@ -14,11 +14,21 @@ from pathlib import Path
 from .config import Config, herdr_config_path
 from .dtach import socket_state
 from .herdr import GONE_CODES, Herdr, HerdrError
+from .layout import (
+    LayoutError,
+    Node,
+    Split,
+    Step,
+    first_leaf,
+    parse_tree,
+    rebuild_steps,
+)
 from .locking import global_lock
 from .sizing import MIN_COLS, MIN_ROWS, split_ratio
 from .state import Pending, Viewer, load_pending, load_state, save_state
 
 _DIRECTION = {"bottom": "down", "side": "right"}
+PARK_LABEL = "repetui-layout"   # the temporary tab panes pass through while the bar is placed
 
 
 @dataclass(frozen=True)
@@ -264,11 +274,12 @@ def _size(value: object, what: str) -> int:
     return value
 
 
-def _ratio(herdr: Herdr, target: str, placement: str, config: Config) -> float:
-    layout = herdr.layout(target)
+def _ratio(layout: dict, target: str, placement: str, config: Config, *, whole_tab: bool = False) -> float:
     dim, minimum, fraction = (("height", MIN_ROWS, config.bottom_fraction) if placement == "bottom"
                               else ("width", MIN_COLS, config.side_fraction))
     tab = _size(layout["area"].get(dim), f"area {dim}")
+    if whole_tab:
+        return split_ratio(fraction, tab, tab, minimum)
     if not all(isinstance(p, dict) for p in layout["panes"]):
         raise HerdrError("bad_response", "pane layout: pane entry is not an object")
     entry = next((p for p in layout["panes"] if p.get("pane_id") == target), None)
@@ -280,15 +291,72 @@ def _ratio(herdr: Herdr, target: str, placement: str, config: Config) -> float:
     return split_ratio(fraction, tab, _size(rect.get(dim), f"rect {dim}"), minimum)
 
 
+def _spanning_tree(layout: dict, config: Config) -> Node | None:
+    """The tab's split tree when the bar should span the whole tab; None for a plain split
+    (setting off, a single pane, a zoomed tab, or a layout we can't read exactly)."""
+    if not config.span_tab or layout.get("zoomed") is True:
+        return None
+    try:
+        tree = parse_tree(layout)
+    except LayoutError:
+        return None
+    return tree if isinstance(tree, Split) else None
+
+
+def _park(herdr: Herdr, steps: list[Step]) -> tuple[set[str], str]:
+    """Move every pane the steps place into one temporary tab. Returns (parked panes, tab id)."""
+    parked: set[str] = set()
+    first, tab = herdr.park(steps[0].pane_id, PARK_LABEL)
+    parked.add(first)
+    for step in steps[1:]:
+        herdr.move_beside(step.pane_id, tab, first, "right", 0.5, focus=False)
+        parked.add(step.pane_id)
+    return parked, tab
+
+
+def _unpark(herdr: Herdr, steps: list[Step], parked: set[str], tab_id: str) -> None:
+    """Move parked panes back in tree order. Best effort: one failure doesn't strand the rest."""
+    stuck: list[str] = []
+    errors: list[HerdrError] = []
+    for step in steps:
+        if step.pane_id not in parked:
+            continue
+        try:
+            herdr.move_beside(step.pane_id, tab_id, step.target, step.direction, step.ratio, focus=False)
+        except HerdrError as exc:
+            stuck.append(step.pane_id)
+            errors.append(exc)
+    if stuck:
+        raise HerdrError(errors[0].code, f"{', '.join(stuck)} left in the {PARK_LABEL!r} tab ({errors[0]})")
+
+
 def _show(placement: str, target: str, ctx: Context, herdr: Herdr, config: Config, plugin_id: str) -> str:
-    ratio = _ratio(herdr, target, placement, config)
+    layout = herdr.layout(target)
+    tree = _spanning_tree(layout, config)
+    anchor = first_leaf(tree) if tree is not None else target
+    steps = rebuild_steps(tree) if tree is not None else []
+    ratio = _ratio(layout, target, placement, config, whole_tab=tree is not None)
     # Marker first: if this action dies before the record is saved, the next one (from any herdr
     # server) scans this server for the orphan. Replaced below by the record, or cleared.
     save_state(config.state_path, None, placement, pending=Pending(herdr.socket_path, time.time()))
     pane = herdr.open_viewer_in_new_tab(plugin_id, ctx.workspace_id)
+    parked: set[str] = set()
     try:
-        moved = herdr.move_beside(pane, ctx.tab_id, target, _DIRECTION[placement], ratio)
+        if steps:
+            # Park the other panes so the anchor's split for the viewer spans the whole tab.
+            # Partly parked counts as parked: whatever moved comes back below.
+            try:
+                parked, _ = _park(herdr, steps)
+            except HerdrError:
+                parked = {s.pane_id for s in steps if s.pane_id not in _pane_ids_in(herdr, ctx.tab_id)}
+                raise
+        moved = herdr.move_beside(pane, ctx.tab_id, anchor, _DIRECTION[placement], ratio)
     except HerdrError:
+        if parked:
+            try:
+                _unpark(herdr, steps, parked, ctx.tab_id)
+            except HerdrError:
+                pass                                     # the original error is the one to report
         # Clear the marker only if herdr confirms closing the pane we opened. A "gone" reply is
         # ambiguous: the move may have happened (new id) with only its reply lost. Any other
         # error is unknown too. Either way the kept marker makes the next action scan this server.
@@ -301,7 +369,17 @@ def _show(placement: str, target: str, ctx: Context, herdr: Herdr, config: Confi
             save_state(config.state_path, None, placement)
         raise
     save_state(config.state_path, Viewer(herdr.socket_path, moved, ctx.tab_id, target, placement), placement)
+    if parked:
+        _unpark(herdr, steps, parked, ctx.tab_id)        # the viewer is recorded first: it is ours either way
+        herdr.focus(moved)
     return moved
+
+
+def _pane_ids_in(herdr: Herdr, tab_id: str) -> set[str]:
+    try:
+        return {p["pane_id"] for p in herdr.panes() if p.get("tab_id") == tab_id}
+    except HerdrError:
+        return set()
 
 
 def _in_this_tab(viewer: Viewer | None, herdr: Herdr, ctx: Context) -> bool:

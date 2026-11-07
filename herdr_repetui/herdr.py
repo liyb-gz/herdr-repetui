@@ -31,6 +31,22 @@ def _need_dict(value: object, what: str) -> dict:
     return value
 
 
+def _moved_pane(envelope: dict) -> dict:
+    # {"id", "result": {"type": "pane_move", "move_result": {"changed": bool, "pane": {...}, "reason"?, ...}}}
+    # A move within one tab is refused: changed false, reason "same_tab" (verified on herdr 0.9.5).
+    result = _result_of(envelope, "pane_move", "pane move")
+    move = _need_dict(result.get("move_result"), "pane move move_result")
+    changed = move.get("changed")
+    if not isinstance(changed, bool):
+        raise _bad("pane move: changed is not a boolean")
+    if not changed:
+        raise HerdrError("not_moved", str(move.get("reason", "unknown")))
+    pane = _need_dict(move.get("pane"), "pane move pane")
+    if not isinstance(pane.get("pane_id"), str) or not pane["pane_id"]:
+        raise _bad("pane move: no pane id")
+    return pane
+
+
 def _result_of(envelope: object, result_type: str, what: str) -> dict:
     """The `result` object of a validated envelope, which must be of the observed `type`."""
     result = _need_dict(_need_dict(envelope, what).get("result"), f"{what} result")
@@ -194,21 +210,20 @@ class Herdr:
             raise _bad("plugin pane open: no pane id")
         return pane_id
 
-    def move_beside(self, pane_id: str, tab_id: str, target_pane_id: str, direction: str, ratio: float) -> str:
+    def move_beside(self, pane_id: str, tab_id: str, target_pane_id: str, direction: str, ratio: float,
+                    *, focus: bool = True) -> str:
         envelope = self.cli("pane", "move", pane_id, "--tab", tab_id, "--target-pane", target_pane_id,
-                            "--split", direction, "--ratio", f"{ratio:.4f}", "--focus")
-        # {"id", "result": {"type": "pane_move", "move_result": {"changed": bool, "pane": {...}, "reason"?, ...}}}
-        result = _result_of(envelope, "pane_move", "pane move")
-        move = _need_dict(result.get("move_result"), "pane move move_result")
-        changed = move.get("changed")
-        if not isinstance(changed, bool):
-            raise _bad("pane move: changed is not a boolean")
-        if not changed:
-            raise HerdrError("not_moved", str(move.get("reason", "unknown")))
-        new_id = _need_dict(move.get("pane"), "pane move pane").get("pane_id")
-        if not isinstance(new_id, str) or not new_id:
-            raise _bad("pane move: no pane id")
-        return new_id
+                            "--split", direction, "--ratio", f"{ratio:.4f}",
+                            "--focus" if focus else "--no-focus")
+        return _moved_pane(envelope)["pane_id"]
+
+    def park(self, pane_id: str, label: str) -> tuple[str, str]:
+        """Move a pane into a new tab of its workspace, unfocused; returns (pane id, new tab id)."""
+        pane = _moved_pane(self.cli("pane", "move", pane_id, "--new-tab", "--label", label, "--no-focus"))
+        tab_id = pane.get("tab_id")
+        if not isinstance(tab_id, str) or not tab_id:
+            raise _bad("pane move: no tab id")
+        return pane["pane_id"], tab_id
 
     def close_viewer(self, pane_id: str, socket_path: str) -> None:
         if socket_path == self.socket_path:

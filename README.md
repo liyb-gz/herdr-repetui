@@ -111,6 +111,7 @@ exist).
 | `profile` | `""` | Anki profile. Empty leaves the choice to repetui |
 | `bottom_fraction` | `0.25` | bottom bar share of the tab height (0 to 1, exclusive) |
 | `side_fraction` | `0.2` | sidebar share of the tab width (0 to 1, exclusive) |
+| `span_tab` | `true` | The bar spans the whole tab, under (or beside) every pane. The other panes pass through a temporary `repetui-layout` tab for a moment, so the tab briefly flickers. Their processes and pane ids are kept, and hiding the bar restores the layout. `false` splits only the focused pane, with no flicker |
 | `state_dir` | `""` | Directory for the default socket (and so its lock and state files). Ignored when `socket` is set. Empty means `$HERDR_PLUGIN_STATE_DIR` |
 
 `socket`, `anki_home` and `state_dir` must be absolute paths; `~` is expanded. A

@@ -26,6 +26,7 @@ class Config:
     bottom_fraction: float
     side_fraction: float
     state_dir: Path
+    span_tab: bool = True  # the bar spans the whole tab, not just the focused pane's column/row
 
     @property
     def lock_path(self) -> Path:
@@ -62,6 +63,13 @@ def _string(raw: Mapping[str, object], key: str, default: str, *, non_empty: boo
         raise ConfigError(f"{key} must be a string, not {type(value).__name__}")
     if non_empty and not value:
         raise ConfigError(f"{key} must not be empty")
+    return value
+
+
+def _bool(raw: Mapping[str, object], key: str, default: bool) -> bool:
+    value = raw.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{key} must be true or false, not {type(value).__name__}")
     return value
 
 
@@ -137,4 +145,5 @@ def load_config(env: Mapping[str, str] = os.environ) -> Config:
         bottom_fraction=_fraction(raw, "bottom_fraction", 0.25),
         side_fraction=_fraction(raw, "side_fraction", 0.2),
         state_dir=state_dir,
+        span_tab=_bool(raw, "span_tab", True),
     )
