@@ -47,6 +47,9 @@ command = "repetui.bar.toggle-side"
 description = "Anki sidebar"
 ```
 
+To uninstall, quit repetui (see below), run `herdr plugin unlink repetui.bar`, remove the
+two `[[keys.command]]` blocks and run `herdr server reload-config` again.
+
 ## Use
 
 - `prefix+a` shows the bottom bar. Press it again to hide it.
@@ -54,6 +57,9 @@ description = "Anki sidebar"
   bar is showing moves the bar to the other side.
 - There is at most one bar at a time, across all tabs and herdr sessions.
   Toggling in another tab moves it there.
+- The bar spans the whole tab: the bottom bar runs under every pane, and the sidebar runs beside
+  every pane. Opening it rearranges the tab for a moment, with a brief flicker; hiding it restores
+  your layout. Set `span_tab = false` (see Config) to split only the focused pane instead.
 - Size: a quarter of the tab height for the bottom bar, a fifth of the tab width
   for the sidebar. The minimum of 6 rows or 40 columns is best effort: in a small
   pane the bar can end up smaller.
@@ -136,7 +142,19 @@ Unix socket path must be shorter than 104 bytes: the default socket moves to
 
 The bar pane runs `launch.py`, which starts repetui under `dtach` if no session
 exists yet (one owner, guarded by a lock file next to the socket) and then
-attaches to it. Toggling opens that pane in a temporary tab and moves it beside
-the pane you are in at the right size, or closes it. Closing the pane ends only
-the dtach client, never repetui. A small state file records the current bar so
-the toggle can find it from any tab.
+attaches to it. Toggling opens that pane in a temporary tab and moves it into
+yours at the right size, or closes it. Closing the pane ends only the dtach
+client, never repetui. A small state file records the current bar so the toggle
+can find it from any tab.
+
+herdr only splits single panes and won't move a pane within its own tab. So to
+span the whole tab, the toggle reads the tab's split tree, moves every pane but
+the first into a temporary `repetui-layout` tab, splits the first pane for the
+bar, and moves the others back in their original arrangement and ratios. Panes
+keep their ids and processes. If a pane can't be moved back, the error names it,
+and it is still running in the `repetui-layout` tab. If the layout can't be read
+exactly, or the tab is zoomed, the bar falls back to splitting the focused pane.
+
+If herdr restarts while the bar is showing, herdr restores a plain shell pane in
+the bar's place; repetui keeps running and is not started again. Close that pane
+and toggle as usual.
